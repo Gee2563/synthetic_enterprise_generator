@@ -1,0 +1,1 @@
+"""Slack source generation components."""
