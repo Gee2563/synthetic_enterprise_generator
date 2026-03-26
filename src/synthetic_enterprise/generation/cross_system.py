@@ -18,6 +18,7 @@ from synthetic_enterprise.domain import (
     Employee,
     EnterpriseGraph,
     Event,
+    EventScenarioResolver,
     Opportunity,
     TicketIssue,
 )
@@ -92,94 +93,43 @@ class CrossSystemRenderer:
         ]
 
     def render_event_bundle(self, event_id: str) -> CrossSystemEventBundle:
-        event = self._event_by_id[event_id]
-        if event.account_id is None:
-            raise ValueError("cross-system rendering requires an account-linked event")
-
-        account = self._account_by_id[event.account_id]
-        contacts = self._contacts_for_account(account.id)
-        organizer = self._employee_by_id[event.organizer_employee_id]
-        account_owner = self._employee_by_id[account.owner_employee_id]
-        opportunity = self._first_opportunity_for_account(account.id)
-        ticket = self._first_ticket_for_account(account.id)
-        support_owner = organizer
-        if ticket is not None and ticket.owner_employee_id is not None:
-            support_owner = self._employee_by_id[ticket.owner_employee_id]
+        scenario = EventScenarioResolver(self.enterprise).for_event(event_id)
 
         return CrossSystemEventBundle(
-            event_id=event.id,
-            account_id=account.id,
+            event_id=scenario.event.id,
+            account_id=scenario.account.id,
             email_records=self._email_records(
-                event=event,
-                account=account,
-                contacts=contacts,
-                organizer=organizer,
-                opportunity=opportunity,
-                ticket=ticket,
+                event=scenario.event,
+                account=scenario.account,
+                contacts=list(scenario.account_contacts),
+                organizer=scenario.organizer,
+                opportunity=scenario.opportunity,
+                ticket=scenario.ticket,
             ),
             slack_records=self._slack_records(
-                event=event,
-                account=account,
-                organizer=organizer,
-                opportunity=opportunity,
-                ticket=ticket,
+                event=scenario.event,
+                account=scenario.account,
+                organizer=scenario.organizer,
+                opportunity=scenario.opportunity,
+                ticket=scenario.ticket,
             ),
             teams_records=self._teams_records(
-                event=event,
-                account=account,
-                organizer=organizer,
-                account_owner=account_owner,
-                support_owner=support_owner,
-                opportunity=opportunity,
-                ticket=ticket,
+                event=scenario.event,
+                account=scenario.account,
+                organizer=scenario.organizer,
+                account_owner=scenario.account_owner,
+                support_owner=scenario.support_owner,
+                opportunity=scenario.opportunity,
+                ticket=scenario.ticket,
             ),
             salesforce_records=self._salesforce_records(
-                event=event,
-                account=account,
-                contacts=contacts,
-                owner=account_owner,
-                opportunity=opportunity,
-                ticket=ticket,
+                event=scenario.event,
+                account=scenario.account,
+                contacts=list(scenario.account_contacts),
+                owner=scenario.account_owner,
+                opportunity=scenario.opportunity,
+                ticket=scenario.ticket,
             ),
-        )
-
-    @property
-    def _event_by_id(self) -> dict[str, Event]:
-        return {event.id: event for event in self.enterprise.events}
-
-    @property
-    def _account_by_id(self) -> dict[str, CustomerAccount]:
-        return {account.id: account for account in self.enterprise.customer_accounts}
-
-    @property
-    def _employee_by_id(self) -> dict[str, Employee]:
-        return {employee.id: employee for employee in self.enterprise.employees}
-
-    def _contacts_for_account(self, account_id: str) -> list[Contact]:
-        return [
-            contact
-            for contact in self.enterprise.contacts
-            if contact.account_id == account_id
-        ]
-
-    def _first_opportunity_for_account(self, account_id: str) -> Opportunity | None:
-        return next(
-            (
-                opportunity
-                for opportunity in self.enterprise.opportunities
-                if opportunity.account_id == account_id
-            ),
-            None,
-        )
-
-    def _first_ticket_for_account(self, account_id: str) -> TicketIssue | None:
-        return next(
-            (
-                ticket
-                for ticket in self.enterprise.ticket_issues
-                if ticket.account_id == account_id
-            ),
-            None,
         )
 
     def _email_records(

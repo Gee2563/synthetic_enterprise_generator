@@ -11,6 +11,7 @@ from synthetic_enterprise.domain import (
     Employee,
     EnterpriseGraph,
     Event,
+    EventScenarioResolver,
     Opportunity,
     TicketIssue,
 )
@@ -82,19 +83,17 @@ class EmailRenderer:
         primary_category: CommunicationCategory,
         message_index_in_thread: int = 0,
     ) -> EmailRecord:
-        event = self._event_by_id[event_id]
-        if event.account_id is None:
-            raise ValueError("event emails require an account-linked event")
-
+        scenario = EventScenarioResolver(self.enterprise).for_event(event_id)
+        event = scenario.event
         taxonomy = CommunicationTaxonomy(primary_category=primary_category)
-        account = self._account_by_id[event.account_id]
-        recipients = [self._contact_by_id[contact_id] for contact_id in event.attendee_contact_ids]
+        account = scenario.account
+        recipients = list(scenario.attendee_contacts)
         if not recipients:
             raise ValueError("event emails require at least one attendee contact")
 
-        organizer = self._employee_by_id[event.organizer_employee_id]
-        opportunity = self._first_opportunity_for_account(event.account_id)
-        ticket = self._first_ticket_for_account(event.account_id)
+        organizer = scenario.organizer
+        opportunity = scenario.opportunity
+        ticket = scenario.ticket
         thread_id = self._thread_id(event.id)
         timestamp = self._timestamp_for(event, taxonomy.primary_category, message_index_in_thread)
         content = self._render_content(
@@ -142,15 +141,13 @@ class EmailRenderer:
         template_index: int,
         message_index_in_thread: int,
     ) -> EmailRecord:
-        event = self._event_by_id[event_id]
-        if event.account_id is None:
-            raise ValueError("hard-negative emails require an account-linked event")
-
-        account = self._account_by_id[event.account_id]
-        recipients = [self._contact_by_id[contact_id] for contact_id in event.attendee_contact_ids]
-        organizer = self._employee_by_id[event.organizer_employee_id]
-        opportunity = self._first_opportunity_for_account(event.account_id)
-        ticket = self._first_ticket_for_account(event.account_id)
+        scenario = EventScenarioResolver(self.enterprise).for_event(event_id)
+        event = scenario.event
+        account = scenario.account
+        recipients = list(scenario.attendee_contacts)
+        organizer = scenario.organizer
+        opportunity = scenario.opportunity
+        ticket = scenario.ticket
         content = self._hard_negative_content(
             event=event,
             account=account,
@@ -194,38 +191,6 @@ class EmailRenderer:
             ),
             provenance=content["provenance"],
             source_system="email",
-        )
-
-    @property
-    def _event_by_id(self) -> dict[str, Event]:
-        return {event.id: event for event in self.enterprise.events}
-
-    @property
-    def _account_by_id(self) -> dict[str, CustomerAccount]:
-        return {account.id: account for account in self.enterprise.customer_accounts}
-
-    @property
-    def _employee_by_id(self) -> dict[str, Employee]:
-        return {employee.id: employee for employee in self.enterprise.employees}
-
-    @property
-    def _contact_by_id(self) -> dict[str, Contact]:
-        return {contact.id: contact for contact in self.enterprise.contacts}
-
-    def _first_opportunity_for_account(self, account_id: str) -> Opportunity | None:
-        return next(
-            (
-                opportunity
-                for opportunity in self.enterprise.opportunities
-                if opportunity.account_id == account_id
-            ),
-            None,
-        )
-
-    def _first_ticket_for_account(self, account_id: str) -> TicketIssue | None:
-        return next(
-            (ticket for ticket in self.enterprise.ticket_issues if ticket.account_id == account_id),
-            None,
         )
 
     def _thread_id(self, event_id: str) -> str:

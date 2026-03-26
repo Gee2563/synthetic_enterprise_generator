@@ -11,6 +11,7 @@ from synthetic_enterprise.domain import (
     Employee,
     EnterpriseGraph,
     Event,
+    EventScenarioResolver,
 )
 from synthetic_enterprise.generation.context import GeneratorContext
 from synthetic_enterprise.generation.hard_negatives import hard_negative_count
@@ -53,30 +54,19 @@ class SlackRenderer:
     enterprise: EnterpriseGraph
 
     def generate_messages(self) -> list[SlackRecord]:
-        account = self.enterprise.customer_accounts[0]
-        event = next(
-            current
-            for current in self.enterprise.events
-            if current.account_id == account.id
-        )
-        opportunity = next(
-            current
-            for current in self.enterprise.opportunities
-            if current.account_id == account.id
-        )
-        ticket = next(
-            current
-            for current in self.enterprise.ticket_issues
-            if current.account_id == account.id
-        )
-        organizer = self._employee_by_id[event.organizer_employee_id]
-        account_owner = self._employee_by_id[account.owner_employee_id]
-        support_owner = organizer
-        if ticket.owner_employee_id is not None:
-            support_owner = self._employee_by_id[ticket.owner_employee_id]
-        primary_contact = next(
-            contact for contact in self.enterprise.contacts if contact.account_id == account.id
-        )
+        scenario = EventScenarioResolver(self.enterprise).primary_account_event()
+        account = scenario.account
+        event = scenario.event
+        opportunity = scenario.opportunity
+        ticket = scenario.ticket
+        organizer = scenario.organizer
+        account_owner = scenario.account_owner
+        support_owner = scenario.support_owner
+        primary_contact = scenario.primary_contact
+        if opportunity is None:
+            raise ValueError("slack rendering requires an account opportunity")
+        if ticket is None:
+            raise ValueError("slack rendering requires an account-linked ticket")
 
         thread_id = self._thread_id(event.id)
         account_channel_name = f"#acct-{_slugify(account.name)}"
@@ -184,10 +174,6 @@ class SlackRenderer:
         )
 
         return [relevant_root, relevant_reply, *noise_messages, *hard_negative_messages]
-
-    @property
-    def _employee_by_id(self) -> dict[str, Employee]:
-        return {employee.id: employee for employee in self.enterprise.employees}
 
     def _build_noise_messages(
         self,

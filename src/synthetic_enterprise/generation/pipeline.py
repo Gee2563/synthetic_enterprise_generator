@@ -4,7 +4,7 @@ import logging
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Literal, TypeAlias, TypeVar
+from typing import Literal, TypeAlias, TypeVar, cast
 
 from synthetic_enterprise.contracts.manifest import DatasetManifest
 from synthetic_enterprise.contracts.records.email import EmailRecord
@@ -105,6 +105,78 @@ class GenerationPipeline:
     context: GeneratorContext
     builder: CompanyBuilder = field(default_factory=CompanyBuilder)
 
+    def build_enterprise(self, *, account_count: int) -> EnterpriseGraph:
+        return self.builder.build(
+            self.context,
+            account_count=account_count,
+        )
+
+    def select_cross_system_bundles(
+        self,
+        *,
+        enterprise: EnterpriseGraph,
+        targets: DatasetTargets,
+    ) -> list[CrossSystemEventBundle]:
+        renderer = CrossSystemRenderer(
+            context=self._variant_context("cross-system"),
+            enterprise=enterprise,
+        )
+        candidate_bundles = renderer.render_all_events()
+        relevant_budget = int(
+            round(
+                (
+                    targets.email_count
+                    + targets.slack_count
+                    + targets.teams_count
+                    + targets.salesforce_count
+                )
+                * (1.0 - self.context.noise_ratio)
+            )
+        )
+        selected: list[CrossSystemEventBundle] = []
+        used_relevant = 0
+
+        for bundle in candidate_bundles:
+            bundle_relevant = sum(record.is_relevant for record in bundle.all_records)
+            if selected and used_relevant + bundle_relevant > relevant_budget:
+                break
+            selected.append(bundle)
+            used_relevant += bundle_relevant
+
+        return selected
+
+    def build_source_records(
+        self,
+        *,
+        source_name: DatasetSourceName,
+        enterprise: EnterpriseGraph,
+        targets: DatasetTargets,
+        bundles: list[CrossSystemEventBundle],
+    ) -> list[DatasetRecord]:
+        target_row_count = targets.rows_for_source(source_name)
+        records = list(
+            self._source_records_from_bundles(
+                source_name=source_name,
+                bundles=bundles,
+            )
+        )
+        iteration = 0
+
+        while len(records) < target_row_count:
+            records.extend(
+                self._non_stream_source_noise_rows(
+                    source_name=source_name,
+                    enterprise=enterprise,
+                    iteration=iteration,
+                )
+            )
+            iteration += 1
+
+        return self._sort_source_records(
+            source_name=source_name,
+            records=records[:target_row_count],
+        )
+
     def plan_source_chunks(
         self,
         *,
@@ -145,79 +217,41 @@ class GenerationPipeline:
         destination_root: Path,
         write_csv: bool = False,
     ) -> GeneratedDataset:
-        enterprise = self.builder.build(
-            self.context,
-            account_count=targets.account_count,
-        )
-        bundles = self._selected_cross_system_bundles(enterprise=enterprise, targets=targets)
+        enterprise = self.build_enterprise(account_count=targets.account_count)
+        bundles = self.select_cross_system_bundles(enterprise=enterprise, targets=targets)
 
-        email_records = self._build_email_records(
-            enterprise=enterprise,
-            targets=targets,
-            bundles=bundles,
-        )
-        slack_records = self._build_slack_records(
-            enterprise=enterprise,
-            targets=targets,
-            bundles=bundles,
-        )
-        teams_records = self._build_teams_records(
-            enterprise=enterprise,
-            targets=targets,
-            bundles=bundles,
-        )
-        salesforce_records = self._build_salesforce_records(
-            enterprise=enterprise,
-            targets=targets,
-            bundles=bundles,
-        )
-
-        manifests = {
-            "email": write_source_dataset(
-                rows=email_records,
+        records_by_source = {
+            source_name: self.build_source_records(
+                source_name=source_name,
+                enterprise=enterprise,
+                targets=targets,
+                bundles=bundles,
+            )
+            for source_name in SOURCE_NAMES
+        }
+        manifests: dict[str, DatasetManifest] = {
+            source_name: write_source_dataset(
+                rows=records_by_source[source_name],
                 destination_root=destination_root,
-                source_name="email",
+                source_name=source_name,
                 seed=self.context.seed,
                 config=self.context.config,
                 chunk_size=targets.chunk_size,
                 write_csv=write_csv,
-            ),
-            "slack": write_source_dataset(
-                rows=slack_records,
-                destination_root=destination_root,
-                source_name="slack",
-                seed=self.context.seed,
-                config=self.context.config,
-                chunk_size=targets.chunk_size,
-                write_csv=write_csv,
-            ),
-            "teams": write_source_dataset(
-                rows=teams_records,
-                destination_root=destination_root,
-                source_name="teams",
-                seed=self.context.seed,
-                config=self.context.config,
-                chunk_size=targets.chunk_size,
-                write_csv=write_csv,
-            ),
-            "salesforce": write_source_dataset(
-                rows=salesforce_records,
-                destination_root=destination_root,
-                source_name="salesforce",
-                seed=self.context.seed,
-                config=self.context.config,
-                chunk_size=targets.chunk_size,
-                write_csv=write_csv,
-            ),
+            )
+            for source_name in SOURCE_NAMES
         }
 
         return GeneratedDataset(
             enterprise=enterprise,
             cross_system_bundles=bundles,
-            email_records=email_records,
-            slack_records=slack_records,
-            teams_records=teams_records,
-            salesforce_records=salesforce_records,
+            email_records=cast(list[EmailRecord], records_by_source["email"]),
+            slack_records=cast(list[SlackRecord], records_by_source["slack"]),
+            teams_records=cast(list[TeamsRecord], records_by_source["teams"]),
+            salesforce_records=cast(
+                list[SalesforceRecord],
+                records_by_source["salesforce"],
+            ),
             manifests=manifests,
         )
 
@@ -234,11 +268,8 @@ class GenerationPipeline:
             raise ValueError("generation_chunk_size must be greater than zero")
 
         progress_logger = logger or logging.getLogger(__name__)
-        enterprise = self.builder.build(
-            self.context,
-            account_count=targets.account_count,
-        )
-        bundles = self._selected_cross_system_bundles(enterprise=enterprise, targets=targets)
+        enterprise = self.build_enterprise(account_count=targets.account_count)
+        bundles = self.select_cross_system_bundles(enterprise=enterprise, targets=targets)
         manifests: dict[str, DatasetManifest] = {}
         chunk_plans: dict[str, list[ChunkPlan]] = {}
 
@@ -329,40 +360,6 @@ class GenerationPipeline:
 
             yield chunk_rows
 
-    def _selected_cross_system_bundles(
-        self,
-        *,
-        enterprise: EnterpriseGraph,
-        targets: DatasetTargets,
-    ) -> list[CrossSystemEventBundle]:
-        renderer = CrossSystemRenderer(
-            context=self._variant_context("cross-system"),
-            enterprise=enterprise,
-        )
-        candidate_bundles = renderer.render_all_events()
-        relevant_budget = int(
-            round(
-                (
-                    targets.email_count
-                    + targets.slack_count
-                    + targets.teams_count
-                    + targets.salesforce_count
-                )
-                * (1.0 - self.context.noise_ratio)
-            )
-        )
-        selected: list[CrossSystemEventBundle] = []
-        used_relevant = 0
-
-        for bundle in candidate_bundles:
-            bundle_relevant = sum(record.is_relevant for record in bundle.all_records)
-            if selected and used_relevant + bundle_relevant > relevant_budget:
-                break
-            selected.append(bundle)
-            used_relevant += bundle_relevant
-
-        return selected
-
     def _build_email_records(
         self,
         *,
@@ -370,31 +367,14 @@ class GenerationPipeline:
         targets: DatasetTargets,
         bundles: list[CrossSystemEventBundle],
     ) -> list[EmailRecord]:
-        records = [
-            record
-            for bundle in bundles
-            for record in bundle.email_records
-        ]
-        events = self._account_linked_events(enterprise)
-        iteration = 0
-
-        while len(records) < targets.email_count:
-            event = events[iteration % len(events)]
-            renderer = EmailRenderer(
-                context=self._variant_context(f"email-noise:{iteration}"),
+        return cast(
+            list[EmailRecord],
+            self.build_source_records(
+                source_name="email",
                 enterprise=enterprise,
-            )
-            noise_rows = [
-                record
-                for record in renderer.generate_messages(event_id=event.id)
-                if not record.is_relevant
-            ]
-            records.extend(noise_rows)
-            iteration += 1
-
-        return sorted(
-            records[:targets.email_count],
-            key=lambda record: (record.timestamp, record.email_id),
+                targets=targets,
+                bundles=bundles,
+            ),
         )
 
     def _build_slack_records(
@@ -404,31 +384,14 @@ class GenerationPipeline:
         targets: DatasetTargets,
         bundles: list[CrossSystemEventBundle],
     ) -> list[SlackRecord]:
-        records = [
-            record
-            for bundle in bundles
-            for record in bundle.slack_records
-        ]
-        account_ids = [account.id for account in enterprise.customer_accounts]
-        iteration = 0
-
-        while len(records) < targets.slack_count:
-            account_id = account_ids[iteration % len(account_ids)]
-            renderer = SlackRenderer(
-                context=self._noise_only_context(f"slack-noise:{iteration}"),
-                enterprise=self._enterprise_for_account(enterprise, account_id),
-            )
-            noise_rows = [
-                record
-                for record in renderer.generate_messages()
-                if not record.is_relevant
-            ]
-            records.extend(noise_rows)
-            iteration += 1
-
-        return sorted(
-            records[:targets.slack_count],
-            key=lambda record: (record.timestamp, record.slack_message_id),
+        return cast(
+            list[SlackRecord],
+            self.build_source_records(
+                source_name="slack",
+                enterprise=enterprise,
+                targets=targets,
+                bundles=bundles,
+            ),
         )
 
     def _build_teams_records(
@@ -438,31 +401,14 @@ class GenerationPipeline:
         targets: DatasetTargets,
         bundles: list[CrossSystemEventBundle],
     ) -> list[TeamsRecord]:
-        records = [
-            record
-            for bundle in bundles
-            for record in bundle.teams_records
-        ]
-        account_ids = [account.id for account in enterprise.customer_accounts]
-        iteration = 0
-
-        while len(records) < targets.teams_count:
-            account_id = account_ids[iteration % len(account_ids)]
-            renderer = TeamsRenderer(
-                context=self._noise_only_context(f"teams-noise:{iteration}"),
-                enterprise=self._enterprise_for_account(enterprise, account_id),
-            )
-            noise_rows = [
-                record
-                for record in renderer.generate_messages()
-                if not record.is_relevant
-            ]
-            records.extend(noise_rows)
-            iteration += 1
-
-        return sorted(
-            records[:targets.teams_count],
-            key=lambda record: (record.timestamp, record.teams_message_id),
+        return cast(
+            list[TeamsRecord],
+            self.build_source_records(
+                source_name="teams",
+                enterprise=enterprise,
+                targets=targets,
+                bundles=bundles,
+            ),
         )
 
     def _build_salesforce_records(
@@ -472,31 +418,14 @@ class GenerationPipeline:
         targets: DatasetTargets,
         bundles: list[CrossSystemEventBundle],
     ) -> list[SalesforceRecord]:
-        records = [
-            record
-            for bundle in bundles
-            for record in bundle.salesforce_records
-        ]
-        account_ids = [account.id for account in enterprise.customer_accounts]
-        iteration = 0
-
-        while len(records) < targets.salesforce_count:
-            account_id = account_ids[iteration % len(account_ids)]
-            renderer = SalesforceRenderer(
-                context=self._variant_context(f"salesforce-noise:{iteration}"),
-                enterprise=self._enterprise_for_account(enterprise, account_id),
-            )
-            noise_rows = [
-                record
-                for record in renderer.generate_records()
-                if not record.is_relevant
-            ]
-            records.extend(noise_rows)
-            iteration += 1
-
-        return sorted(
-            records[:targets.salesforce_count],
-            key=lambda record: (record.timestamp, record.salesforce_record_id),
+        return cast(
+            list[SalesforceRecord],
+            self.build_source_records(
+                source_name="salesforce",
+                enterprise=enterprise,
+                targets=targets,
+                bundles=bundles,
+            ),
         )
 
     def _source_records_from_bundles(
@@ -525,13 +454,44 @@ class GenerationPipeline:
         batch_seed = GeneratorContext(seed=chunk_seed, config=self.context.config).derive_seed(
             f"batch:{source_name}:{batch_index}"
         )
+        return self._render_source_noise_rows(
+            source_name=source_name,
+            enterprise=enterprise,
+            batch_iteration=batch_iteration,
+            seed=batch_seed,
+            streaming=True,
+        )
 
+    def _non_stream_source_noise_rows(
+        self,
+        *,
+        source_name: DatasetSourceName,
+        enterprise: EnterpriseGraph,
+        iteration: int,
+    ) -> list[DatasetRecord]:
+        return self._render_source_noise_rows(
+            source_name=source_name,
+            enterprise=enterprise,
+            batch_iteration=iteration,
+            seed=self.context.derive_seed(f"pipeline:{source_name}-noise:{iteration}"),
+            streaming=False,
+        )
+
+    def _render_source_noise_rows(
+        self,
+        *,
+        source_name: DatasetSourceName,
+        enterprise: EnterpriseGraph,
+        batch_iteration: int,
+        seed: int,
+        streaming: bool,
+    ) -> list[DatasetRecord]:
         if source_name == "email":
             event = self._account_linked_events(enterprise)[
                 batch_iteration % len(self._account_linked_events(enterprise))
             ]
             email_renderer = EmailRenderer(
-                context=self._context_from_seed(batch_seed),
+                context=self._context_from_seed(seed),
                 enterprise=enterprise,
             )
             return [
@@ -544,10 +504,12 @@ class GenerationPipeline:
             batch_iteration % len(enterprise.customer_accounts)
         ].id
         account_enterprise = self._enterprise_for_account(enterprise, account_id)
+        noise_only = source_name in {"slack", "teams"}
+        renderer_context = self._context_from_seed(seed, noise_only=noise_only)
 
         if source_name == "slack":
             slack_renderer = SlackRenderer(
-                context=self._context_from_seed(batch_seed, noise_only=True),
+                context=renderer_context,
                 enterprise=account_enterprise,
             )
             return [
@@ -558,7 +520,7 @@ class GenerationPipeline:
 
         if source_name == "teams":
             teams_renderer = TeamsRenderer(
-                context=self._context_from_seed(batch_seed, noise_only=True),
+                context=renderer_context,
                 enterprise=account_enterprise,
             )
             return [
@@ -568,7 +530,7 @@ class GenerationPipeline:
             ]
 
         salesforce_renderer = SalesforceRenderer(
-            context=self._context_from_seed(batch_seed),
+            context=renderer_context if streaming else self._context_from_seed(seed),
             enterprise=account_enterprise,
         )
         return [
@@ -576,6 +538,44 @@ class GenerationPipeline:
             for record in salesforce_renderer.generate_records()
             if not record.is_relevant
         ]
+
+    def _sort_source_records(
+        self,
+        *,
+        source_name: DatasetSourceName,
+        records: list[DatasetRecord],
+    ) -> list[DatasetRecord]:
+        if source_name == "email":
+            return sorted(
+                records,
+                key=lambda record: (
+                    record.timestamp,
+                    cast(EmailRecord, record).email_id,
+                ),
+            )
+        if source_name == "slack":
+            return sorted(
+                records,
+                key=lambda record: (
+                    record.timestamp,
+                    cast(SlackRecord, record).slack_message_id,
+                ),
+            )
+        if source_name == "teams":
+            return sorted(
+                records,
+                key=lambda record: (
+                    record.timestamp,
+                    cast(TeamsRecord, record).teams_message_id,
+                ),
+            )
+        return sorted(
+            records,
+            key=lambda record: (
+                record.timestamp,
+                cast(SalesforceRecord, record).salesforce_record_id,
+            ),
+        )
 
     def _variant_context(self, namespace: str) -> GeneratorContext:
         return self._context_from_seed(

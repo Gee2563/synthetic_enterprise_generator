@@ -267,11 +267,8 @@ def _generate_single_source(
         account_count=int(args.account_count),
         chunk_size=args.chunk_size,
     )
-    enterprise = pipeline.builder.build(
-        pipeline.context,
-        account_count=targets.account_count,
-    )
-    bundles = pipeline._selected_cross_system_bundles(enterprise=enterprise, targets=targets)
+    enterprise = pipeline.build_enterprise(account_count=targets.account_count)
+    bundles = pipeline.select_cross_system_bundles(enterprise=enterprise, targets=targets)
 
     if args.stream:
         chunk_plans = pipeline.plan_source_chunks(
@@ -294,8 +291,7 @@ def _generate_single_source(
             write_csv=bool(args.write_csv),
         )
     else:
-        rows = _rows_for_source(
-            pipeline=pipeline,
+        rows = pipeline.build_source_records(
             source_name=source_name,
             enterprise=enterprise,
             targets=targets,
@@ -313,39 +309,6 @@ def _generate_single_source(
 
     _write_company_state(enterprise=enterprise, destination_root=output_root)
     return 0
-
-
-def _rows_for_source(
-    *,
-    pipeline: GenerationPipeline,
-    source_name: DatasetSourceName,
-    enterprise: EnterpriseGraph,
-    targets: DatasetTargets,
-    bundles: list[Any],
-) -> Sequence[Any]:
-    if source_name == "email":
-        return pipeline._build_email_records(
-            enterprise=enterprise,
-            targets=targets,
-            bundles=bundles,
-        )
-    if source_name == "slack":
-        return pipeline._build_slack_records(
-            enterprise=enterprise,
-            targets=targets,
-            bundles=bundles,
-        )
-    if source_name == "teams":
-        return pipeline._build_teams_records(
-            enterprise=enterprise,
-            targets=targets,
-            bundles=bundles,
-        )
-    return pipeline._build_salesforce_records(
-        enterprise=enterprise,
-        targets=targets,
-        bundles=bundles,
-    )
 
 
 def _single_source_targets(

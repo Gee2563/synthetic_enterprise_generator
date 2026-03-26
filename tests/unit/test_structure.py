@@ -18,6 +18,7 @@ def test_package_structure_is_valid() -> None:
         "contracts/records/teams.py",
         "domain/__init__.py",
         "domain/company.py",
+        "domain/scenarios.py",
         "evaluation/__init__.py",
         "evaluation/gold_set.py",
         "evaluation/quality_report.py",

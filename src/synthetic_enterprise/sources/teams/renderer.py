@@ -6,7 +6,13 @@ from datetime import datetime, timedelta
 from typing import Literal, TypedDict
 
 from synthetic_enterprise.contracts.records.teams import TeamsRecord
-from synthetic_enterprise.domain import CustomerAccount, Employee, EnterpriseGraph, Event
+from synthetic_enterprise.domain import (
+    CustomerAccount,
+    Employee,
+    EnterpriseGraph,
+    Event,
+    EventScenarioResolver,
+)
 from synthetic_enterprise.generation.context import GeneratorContext
 from synthetic_enterprise.generation.hard_negatives import hard_negative_count
 from synthetic_enterprise.labeling.grounding import (
@@ -51,27 +57,18 @@ class TeamsRenderer:
     enterprise: EnterpriseGraph
 
     def generate_messages(self) -> list[TeamsRecord]:
-        account = self.enterprise.customer_accounts[0]
-        event = next(
-            current
-            for current in self.enterprise.events
-            if current.account_id == account.id
-        )
-        opportunity = next(
-            current
-            for current in self.enterprise.opportunities
-            if current.account_id == account.id
-        )
-        ticket = next(
-            current
-            for current in self.enterprise.ticket_issues
-            if current.account_id == account.id
-        )
-        organizer = self._employee_by_id[event.organizer_employee_id]
-        account_owner = self._employee_by_id[account.owner_employee_id]
-        support_owner = organizer
-        if ticket.owner_employee_id is not None:
-            support_owner = self._employee_by_id[ticket.owner_employee_id]
+        scenario = EventScenarioResolver(self.enterprise).primary_account_event()
+        account = scenario.account
+        event = scenario.event
+        opportunity = scenario.opportunity
+        ticket = scenario.ticket
+        organizer = scenario.organizer
+        account_owner = scenario.account_owner
+        support_owner = scenario.support_owner
+        if opportunity is None:
+            raise ValueError("teams rendering requires an account opportunity")
+        if ticket is None:
+            raise ValueError("teams rendering requires an account-linked ticket")
 
         relevant_messages = self._build_relevant_messages(
             account=account,
@@ -91,15 +88,12 @@ class TeamsRenderer:
         hard_negative_messages = self._build_hard_negative_messages(
             account=account,
             event=event,
+            organizer=organizer,
             opportunity_id=opportunity.id,
             ticket_id=ticket.id,
         )
 
         return [*relevant_messages, *noise_messages, *hard_negative_messages]
-
-    @property
-    def _employee_by_id(self) -> dict[str, Employee]:
-        return {employee.id: employee for employee in self.enterprise.employees}
 
     def _build_relevant_messages(
         self,
@@ -254,6 +248,7 @@ class TeamsRenderer:
         *,
         account: CustomerAccount,
         event: Event,
+        organizer: Employee,
         opportunity_id: str,
         ticket_id: str,
     ) -> list[TeamsRecord]:
@@ -273,7 +268,7 @@ class TeamsRenderer:
         channel_id = self._channel_id(team_name, channel_name)
         thread_id = self._thread_id(event.id)
         meeting_id = self._meeting_id(event.id)
-        sender_employee_id = self._employee_by_id[event.organizer_employee_id].id
+        sender_employee_id = organizer.id
         messages: list[TeamsRecord] = []
 
         for index in range(total):

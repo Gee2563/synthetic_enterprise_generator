@@ -13,6 +13,7 @@ from synthetic_enterprise.domain import (
     Employee,
     EnterpriseGraph,
     Event,
+    EventScenarioResolver,
     Opportunity,
 )
 from synthetic_enterprise.generation.context import GeneratorContext
@@ -34,28 +35,17 @@ class SalesforceRenderer:
     enterprise: EnterpriseGraph
 
     def generate_records(self) -> list[SalesforceRecord]:
-        account = self.enterprise.customer_accounts[0]
-        contacts = [
-            contact
-            for contact in self.enterprise.contacts
-            if contact.account_id == account.id
-        ]
-        opportunity = next(
-            current
-            for current in self.enterprise.opportunities
-            if current.account_id == account.id
-        )
-        event = next(
-            current
-            for current in self.enterprise.events
-            if current.account_id == account.id
-        )
-        case = next(
-            current
-            for current in self.enterprise.ticket_issues
-            if current.account_id == account.id
-        )
-        owner = self._employee_by_id[account.owner_employee_id]
+        scenario = EventScenarioResolver(self.enterprise).primary_account_event()
+        account = scenario.account
+        contacts = list(scenario.account_contacts)
+        opportunity = scenario.opportunity
+        event = scenario.event
+        case = scenario.ticket
+        owner = scenario.account_owner
+        if opportunity is None:
+            raise ValueError("salesforce rendering requires an account opportunity")
+        if case is None:
+            raise ValueError("salesforce rendering requires an account-linked ticket")
         campaign_id = self._campaign_id("customer-review")
         lead_id = self._lead_id("stale-webinar-lead")
         stale_opportunity_id = self._opportunity_id("stale-opportunity")
@@ -136,10 +126,6 @@ class SalesforceRenderer:
         )
 
         return records
-
-    @property
-    def _employee_by_id(self) -> dict[str, Employee]:
-        return {employee.id: employee for employee in self.enterprise.employees}
 
     def _account_records(
         self,

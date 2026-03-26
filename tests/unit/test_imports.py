@@ -11,6 +11,7 @@ EXPECTED_MODULES = [
     "synthetic_enterprise.contracts.records.slack",
     "synthetic_enterprise.contracts.records.teams",
     "synthetic_enterprise.domain.company",
+    "synthetic_enterprise.domain.scenarios",
     "synthetic_enterprise.evaluation.gold_set",
     "synthetic_enterprise.evaluation.quality_report",
     "synthetic_enterprise.evaluation.training_formats",

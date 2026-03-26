@@ -9,6 +9,7 @@ from synthetic_enterprise.domain.issues import TicketIssue
 from synthetic_enterprise.domain.opportunities import Opportunity
 from synthetic_enterprise.domain.people import Contact, Employee
 from synthetic_enterprise.domain.product import Product
+from synthetic_enterprise.domain.scenarios import EventScenarioContext, EventScenarioResolver
 
 __all__ = [
     "CRMActivity",
@@ -19,6 +20,8 @@ __all__ = [
     "Department",
     "Employee",
     "EnterpriseGraph",
+    "EventScenarioContext",
+    "EventScenarioResolver",
     "Event",
     "MessageEnvelope",
     "Opportunity",
