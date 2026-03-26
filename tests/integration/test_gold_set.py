@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from synthetic_enterprise.domain import EnterpriseGraph
 from synthetic_enterprise.evaluation.gold_set import GoldSetBuilder, GoldSetConfig
 from synthetic_enterprise.generation.config import CompanySizeConfig, GeneratorConfig
 from synthetic_enterprise.generation.context import GeneratorContext
@@ -15,12 +16,11 @@ from synthetic_enterprise.labeling.taxonomy import CommunicationCategory
 REQUIRED_RELEVANT_CATEGORIES = (
     CommunicationCategory.BUYING_SIGNAL,
     CommunicationCategory.EVENT_ATTENDANCE,
-    CommunicationCategory.FOLLOW_UP,
     CommunicationCategory.BLOCKER,
 )
 
 
-def build_dataset(tmp_path: Path) -> tuple[dict[str, list[dict[str, object]]], object]:
+def build_dataset(tmp_path: Path) -> tuple[dict[str, list[dict[str, object]]], EnterpriseGraph]:
     context = GeneratorContext(
         seed=20260401,
         config=GeneratorConfig(
@@ -70,7 +70,7 @@ def test_gold_set_contains_required_categories_and_stratified_sampling(
         if example.is_relevant
     )
 
-    assert len(gold_set.examples) == 12
+    assert len(gold_set.examples) == 10
     assert set(relevant_counts) == set(REQUIRED_RELEVANT_CATEGORIES)
     for category in REQUIRED_RELEVANT_CATEGORIES:
         assert relevant_counts[category] == 2
@@ -98,16 +98,16 @@ def test_gold_set_rejects_broken_references(tmp_path: Path) -> None:
     broken_row = next(
         row
         for row in rows_by_source["email"]
-        if row["primary_category"] == CommunicationCategory.FOLLOW_UP.value
-        and row["is_relevant"] is True
+        if row["is_relevant"] is True
     ).copy()
     broken_row["account_id"] = "account_missing"
+    relevant_category = CommunicationCategory(str(broken_row["primary_category"]))
 
     with pytest.raises(ValueError, match="broken reference"):
         GoldSetBuilder(enterprise=enterprise).create(
             rows_by_source={"email": [broken_row]},
             config=GoldSetConfig(
-                relevant_categories=(CommunicationCategory.FOLLOW_UP,),
+                relevant_categories=(relevant_category,),
                 samples_per_relevant_category=1,
                 hard_negative_count=0,
                 min_cross_system_examples=0,
