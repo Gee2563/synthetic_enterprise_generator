@@ -7,6 +7,7 @@ def test_package_structure_is_valid() -> None:
     expected_paths = [
         "__init__.py",
         "app/__init__.py",
+        "app/cli.py",
         "app/settings.py",
         "contracts/__init__.py",
         "contracts/company_state.py",
@@ -20,6 +21,7 @@ def test_package_structure_is_valid() -> None:
         "evaluation/__init__.py",
         "evaluation/gold_set.py",
         "evaluation/quality_report.py",
+        "evaluation/training_formats.py",
         "generation/__init__.py",
         "generation/config.py",
         "generation/context.py",

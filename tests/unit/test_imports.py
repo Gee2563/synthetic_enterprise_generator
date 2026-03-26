@@ -3,6 +3,7 @@ from importlib import import_module
 import synthetic_enterprise
 
 EXPECTED_MODULES = [
+    "synthetic_enterprise.app.cli",
     "synthetic_enterprise.app.settings",
     "synthetic_enterprise.contracts.company_state",
     "synthetic_enterprise.contracts.records.email",
@@ -12,6 +13,7 @@ EXPECTED_MODULES = [
     "synthetic_enterprise.domain.company",
     "synthetic_enterprise.evaluation.gold_set",
     "synthetic_enterprise.evaluation.quality_report",
+    "synthetic_enterprise.evaluation.training_formats",
     "synthetic_enterprise.generation.config",
     "synthetic_enterprise.generation.context",
     "synthetic_enterprise.generation.cross_system",
