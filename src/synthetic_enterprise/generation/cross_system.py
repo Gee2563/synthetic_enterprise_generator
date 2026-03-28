@@ -18,11 +18,17 @@ from synthetic_enterprise.domain import (
     Employee,
     EnterpriseGraph,
     Event,
+    EventScenarioContext,
     EventScenarioResolver,
     Opportunity,
     TicketIssue,
 )
 from synthetic_enterprise.domain.base import EnterpriseModel
+from synthetic_enterprise.generation.account_profiles import (
+    AccountBehaviorProfile,
+    AccountBehaviorProfileType,
+    AccountBehaviorResolver,
+)
 from synthetic_enterprise.generation.context import GeneratorContext
 from synthetic_enterprise.labeling.grounding import (
     LabelProvenance,
@@ -86,11 +92,26 @@ class CrossSystemRenderer:
             total_events=len(events),
             ratio=self.context.cross_system_ratio,
         )
+        scenario_resolver = EventScenarioResolver(self.enterprise)
+        behavior_resolver = AccountBehaviorResolver(
+            context=self.context,
+            enterprise=self.enterprise,
+        )
 
-        return [
-            self.render_event_bundle(event.id)
-            for event in events[:selected_count]
-        ]
+        bundles: list[CrossSystemEventBundle] = []
+        for index, event in enumerate(events[:selected_count]):
+            scenario = scenario_resolver.for_event(event.id)
+            bundles.append(
+                self._apply_account_behavior_profile(
+                    bundle=self.render_event_bundle(event.id),
+                    scenario=scenario,
+                    profile=behavior_resolver.profile_for_account(scenario.account.id),
+                    event=event,
+                    event_index=index,
+                    total_selected=selected_count,
+                )
+            )
+        return bundles
 
     def render_event_bundle(self, event_id: str) -> CrossSystemEventBundle:
         scenario = EventScenarioResolver(self.enterprise).for_event(event_id)
@@ -164,22 +185,23 @@ class CrossSystemRenderer:
             f"{contact.first_name} {contact.last_name}"
             for contact in contacts[:2]
         )
+        attendance_timestamp = event.ends_at + timedelta(minutes=20)
 
         return [
             EmailRecord(
                 email_id=self._id("email", f"{event.id}:invite"),
                 thread_id=self._id("thread", f"{event.id}:email-thread"),
                 message_index_in_thread=0,
-                timestamp=event.starts_at - timedelta(days=2),
+                timestamp=attendance_timestamp,
                 sender_employee_id=organizer.id,
                 sender_contact_id=None,
                 to=[contact.id for contact in contacts[:2]],
                 cc=[],
                 bcc=[],
-                subject=f"Confirmed attendees for {event.title}",
+                subject=f"Attendance recap for {event.title}",
                 body=(
-                    f"Confirmed attendees for {event.title} at {account.name}: "
-                    f"{attendee_names}."
+                    f"Thanks for joining {event.title}. We saw {attendee_names} "
+                    f"joined live for {account.name}."
                 ),
                 attachments=["invite.ics"],
                 account_id=account.id,
@@ -342,6 +364,49 @@ class CrossSystemRenderer:
                 )
             )
 
+        if len(contacts := self._event_contacts(event=event, account=account)) >= 2:
+            attendance_provenance = LabelProvenance(
+                object_type=ProvenanceObjectType.EVENT,
+                object_id=event.id,
+                explanation="Live attendance is being referenced during the customer review.",
+            )
+            attended_contact = contacts[0]
+            no_show_contact = contacts[1]
+            records.append(
+                SlackRecord(
+                    slack_message_id=self._id(
+                        "slack_message",
+                        f"{event.id}:slack-attendance",
+                    ),
+                    channel_id=self._id("channel", f"{event.id}:slack-channel"),
+                    channel_name=channel_name,
+                    thread_id=thread_id,
+                    parent_message_id=records[0].slack_message_id,
+                    timestamp=event.starts_at + timedelta(minutes=15),
+                    sender_employee_id=organizer.id,
+                    body=(
+                        f"{attended_contact.first_name} is already on the bridge for "
+                        f"{event.title}; {no_show_contact.first_name} never made it."
+                    ),
+                    mentions=[],
+                    reactions=[":spiral_calendar_pad:"],
+                    attachments=[],
+                    linked_account_id=account.id,
+                    linked_opportunity_id=None,
+                    linked_event_id=event.id,
+                    linked_ticket_id=None,
+                    primary_category=CommunicationCategory.EVENT_ATTENDANCE,
+                    is_relevant=True,
+                    relevance_reason=build_relevance_reason(
+                        primary_category=CommunicationCategory.EVENT_ATTENDANCE,
+                        is_relevant=True,
+                        provenance=attendance_provenance,
+                    ),
+                    provenance=attendance_provenance,
+                    source_system="slack",
+                )
+            )
+
         return records
 
     def _teams_records(
@@ -399,6 +464,43 @@ class CrossSystemRenderer:
                 source_system="teams",
             )
         ]
+
+        records.append(
+            TeamsRecord(
+                teams_message_id=self._id(
+                    "teams_message",
+                    f"{event.id}:teams-attendance-recap",
+                ),
+                team_id=team_id,
+                channel_id=channel_id,
+                chat_or_channel="channel",
+                thread_id=thread_id,
+                timestamp=event.ends_at + timedelta(minutes=10),
+                sender_employee_id=organizer.id,
+                body=(
+                    "Recap:\n"
+                    f"- live attendance confirmed for {account.name}\n"
+                    "- one attendee missed the session\n"
+                    "- send recording and follow-up notes"
+                ),
+                mentions=[account_owner.id],
+                meeting_id=meeting_id,
+                file_refs=["meeting-notes.docx"],
+                linked_account_id=account.id,
+                linked_opportunity_id=linked_opportunity_id,
+                linked_event_id=event.id,
+                linked_ticket_id=None,
+                primary_category=CommunicationCategory.EVENT_ATTENDANCE,
+                is_relevant=True,
+                relevance_reason=build_relevance_reason(
+                    primary_category=CommunicationCategory.EVENT_ATTENDANCE,
+                    is_relevant=True,
+                    provenance=coordination_provenance,
+                ),
+                provenance=coordination_provenance,
+                source_system="teams",
+            )
+        )
 
         if ticket is not None:
             blocker_provenance = LabelProvenance(
@@ -529,7 +631,7 @@ class CrossSystemRenderer:
                         "campaign_member",
                         f"{event.id}:campaign-member",
                     ),
-                    timestamp=event.starts_at,
+                    timestamp=event.ends_at + timedelta(hours=1),
                     campaign_id=campaign_id,
                     contact_id=attendee_ids[0],
                     event_id=event.id,
@@ -553,6 +655,46 @@ class CrossSystemRenderer:
                     source_system="salesforce",
                 )
             )
+            if len(attendee_ids) > 1:
+                records.append(
+                    SalesforceRecord(
+                        salesforce_record_id=self._id(
+                            "sf_record",
+                            f"{event.id}:sf-campaign-member-no-show",
+                        ),
+                        object_type=SalesforceObjectType.CAMPAIGN_MEMBER,
+                        record_id=self._id(
+                            "campaign_member",
+                            f"{event.id}:campaign-member-no-show",
+                        ),
+                        timestamp=event.ends_at + timedelta(hours=1, minutes=20),
+                        campaign_id=campaign_id,
+                        contact_id=attendee_ids[1],
+                        event_id=event.id,
+                        structured_fields={"member_status": "No Show"},
+                        primary_category=CommunicationCategory.EVENT_ATTENDANCE,
+                        is_relevant=True,
+                        relevance_reason=build_relevance_reason(
+                            primary_category=CommunicationCategory.EVENT_ATTENDANCE,
+                            is_relevant=True,
+                            provenance=LabelProvenance(
+                                object_type=ProvenanceObjectType.EVENT,
+                                object_id=event.id,
+                                explanation=(
+                                    "Attendance outcome is linked to the event and campaign."
+                                ),
+                            ),
+                        ),
+                        provenance=LabelProvenance(
+                            object_type=ProvenanceObjectType.EVENT,
+                            object_id=event.id,
+                            explanation=(
+                                "Attendance outcome is linked to the event and campaign."
+                            ),
+                        ),
+                        source_system="salesforce",
+                    )
+                )
 
         task_category = CommunicationCategory.FOLLOW_UP
         task_provenance = LabelProvenance(
@@ -642,7 +784,7 @@ class CrossSystemRenderer:
                     salesforce_record_id=self._id("sf_record", f"{event.id}:sf-note"),
                     object_type=SalesforceObjectType.NOTE,
                     record_id=self._id("note", f"{event.id}:note"),
-                    timestamp=event.ends_at + timedelta(minutes=30),
+                    timestamp=event.ends_at + timedelta(hours=3),
                     owner_employee_id=owner.id,
                     account_id=account.id,
                     opportunity_id=opportunity.id,
@@ -667,6 +809,352 @@ class CrossSystemRenderer:
             )
 
         return records
+
+    def _apply_account_behavior_profile(
+        self,
+        *,
+        bundle: CrossSystemEventBundle,
+        scenario: EventScenarioContext,
+        profile: AccountBehaviorProfile,
+        event: Event,
+        event_index: int,
+        total_selected: int,
+    ) -> CrossSystemEventBundle:
+        visible_systems = self._visible_systems_for_event(
+            event=event,
+            event_index=event_index,
+            total_selected=total_selected,
+            preferred_systems=profile.preferred_systems,
+        )
+        bundle = bundle.model_copy(
+            update={
+                "email_records": [
+                    *bundle.email_records,
+                    *self._profile_email_records(
+                        scenario=scenario,
+                        profile=profile,
+                    ),
+                ],
+                "slack_records": [
+                    *bundle.slack_records,
+                    *self._profile_slack_records(
+                        scenario=scenario,
+                        profile=profile,
+                    ),
+                ],
+                "teams_records": [
+                    *bundle.teams_records,
+                    *self._profile_teams_records(
+                        scenario=scenario,
+                        profile=profile,
+                    ),
+                ],
+                "salesforce_records": [
+                    *bundle.salesforce_records,
+                    *self._profile_salesforce_records(
+                        scenario=scenario,
+                        profile=profile,
+                    ),
+                ],
+            }
+        )
+
+        if len(visible_systems) == 4:
+            return bundle
+
+        return bundle.model_copy(
+            update={
+                "email_records": bundle.email_records if "email" in visible_systems else [],
+                "slack_records": bundle.slack_records if "slack" in visible_systems else [],
+                "teams_records": bundle.teams_records if "teams" in visible_systems else [],
+                "salesforce_records": (
+                    bundle.salesforce_records if "salesforce" in visible_systems else []
+                ),
+            }
+        )
+
+    def _visible_systems_for_event(
+        self,
+        *,
+        event: Event,
+        event_index: int,
+        total_selected: int,
+        preferred_systems: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        del event, event_index, total_selected
+        return preferred_systems
+
+    def _profile_email_records(
+        self,
+        *,
+        scenario: EventScenarioContext,
+        profile: AccountBehaviorProfile,
+    ) -> list[EmailRecord]:
+        if profile.profile_type == AccountBehaviorProfileType.HIGHLY_ENGAGED_CHAMPION_LED:
+            opportunity = scenario.opportunity
+            if opportunity is None:
+                return []
+            organizer = scenario.organizer
+            account = scenario.account
+            contacts = list(scenario.account_contacts)[:2]
+            provenance = LabelProvenance(
+                object_type=ProvenanceObjectType.OPPORTUNITY,
+                object_id=opportunity.id,
+                explanation="Champion-led account is pushing the commercial motion forward.",
+            )
+            return [
+                EmailRecord(
+                    email_id=self._id("email", f"{scenario.event.id}:profile:champion"),
+                    thread_id=self._id("thread", f"{scenario.event.id}:email-thread"),
+                    message_index_in_thread=2,
+                    timestamp=scenario.event.ends_at + timedelta(hours=3),
+                    sender_employee_id=organizer.id,
+                    sender_contact_id=None,
+                    to=[contact.id for contact in contacts],
+                    cc=[account.owner_employee_id],
+                    bcc=[],
+                    subject=f"Expansion path after {scenario.event.title}",
+                    body=(
+                        f"{account.name} wants to keep the {opportunity.stage} motion moving "
+                        "and asked for the next expansion step."
+                    ),
+                    attachments=[],
+                    account_id=account.id,
+                    opportunity_id=opportunity.id,
+                    event_id=scenario.event.id,
+                    ticket_id=None,
+                    primary_category=CommunicationCategory.BUYING_SIGNAL,
+                    is_relevant=True,
+                    relevance_reason=build_relevance_reason(
+                        primary_category=CommunicationCategory.BUYING_SIGNAL,
+                        is_relevant=True,
+                        provenance=provenance,
+                    ),
+                    provenance=provenance,
+                    source_system="email",
+                )
+            ]
+
+        if profile.profile_type == AccountBehaviorProfileType.EXECUTIVE_SPONSORED_EXPANSION:
+            organizer = scenario.organizer
+            account = scenario.account
+            contacts = list(scenario.account_contacts)[:1]
+            provenance = LabelProvenance(
+                object_type=ProvenanceObjectType.ACCOUNT,
+                object_id=account.id,
+                explanation="Executive sponsor review is already active on this account.",
+            )
+            return [
+                EmailRecord(
+                    email_id=self._id("email", f"{scenario.event.id}:profile:executive"),
+                    thread_id=self._id("thread", f"{scenario.event.id}:email-thread"),
+                    message_index_in_thread=2,
+                    timestamp=scenario.event.ends_at + timedelta(hours=4),
+                    sender_employee_id=organizer.id,
+                    sender_contact_id=None,
+                    to=[contact.id for contact in contacts],
+                    cc=[account.owner_employee_id],
+                    bcc=[],
+                    subject=f"Executive sponsor follow-up for {account.name}",
+                    body=(
+                        f"{account.name} asked to bring the executive sponsor into the next "
+                        "commercial review."
+                    ),
+                    attachments=[],
+                    account_id=account.id,
+                    opportunity_id=None,
+                    event_id=scenario.event.id,
+                    ticket_id=None,
+                    primary_category=CommunicationCategory.DECISION_MAKER_SIGNAL,
+                    is_relevant=True,
+                    relevance_reason=build_relevance_reason(
+                        primary_category=CommunicationCategory.DECISION_MAKER_SIGNAL,
+                        is_relevant=True,
+                        provenance=provenance,
+                    ),
+                    provenance=provenance,
+                    source_system="email",
+                )
+            ]
+
+        return []
+
+    def _profile_slack_records(
+        self,
+        *,
+        scenario: EventScenarioContext,
+        profile: AccountBehaviorProfile,
+    ) -> list[SlackRecord]:
+        if profile.profile_type != AccountBehaviorProfileType.SUPPORT_INTENSIVE_UNHAPPY:
+            return []
+
+        ticket = scenario.ticket
+        if ticket is None:
+            return []
+        organizer = scenario.organizer
+        account = scenario.account
+        provenance = LabelProvenance(
+            object_type=ProvenanceObjectType.TICKET,
+            object_id=ticket.id,
+            explanation="Support-intensive account is escalating the unresolved ticket internally.",
+        )
+        return [
+            SlackRecord(
+                slack_message_id=self._id(
+                    "slack_message",
+                    f"{scenario.event.id}:profile:support-escalation",
+                ),
+                channel_id=self._id("channel", f"{scenario.event.id}:slack-channel"),
+                channel_name=f"#acct-{_slugify(account.name)}",
+                thread_id=self._id("slack_thread", f"{scenario.event.id}:slack-thread"),
+                parent_message_id=None,
+                timestamp=scenario.event.ends_at + timedelta(minutes=45),
+                sender_employee_id=organizer.id,
+                body=(
+                    "Escalating this internally because the customer still sees the issue "
+                    "and wants a named owner."
+                ),
+                mentions=[],
+                reactions=[":rotating_light:"],
+                attachments=[],
+                linked_account_id=account.id,
+                linked_opportunity_id=None,
+                linked_event_id=scenario.event.id,
+                linked_ticket_id=ticket.id,
+                primary_category=CommunicationCategory.ESCALATION,
+                is_relevant=True,
+                relevance_reason=build_relevance_reason(
+                    primary_category=CommunicationCategory.ESCALATION,
+                    is_relevant=True,
+                    provenance=provenance,
+                ),
+                provenance=provenance,
+                source_system="slack",
+            )
+        ]
+
+    def _profile_teams_records(
+        self,
+        *,
+        scenario: EventScenarioContext,
+        profile: AccountBehaviorProfile,
+    ) -> list[TeamsRecord]:
+        if profile.profile_type != AccountBehaviorProfileType.HIGHLY_ENGAGED_CHAMPION_LED:
+            return []
+
+        account = scenario.account
+        organizer = scenario.organizer
+        account_owner = scenario.account_owner
+        opportunity = scenario.opportunity
+        if opportunity is None:
+            return []
+        provenance = LabelProvenance(
+            object_type=ProvenanceObjectType.OPPORTUNITY,
+            object_id=opportunity.id,
+            explanation="Champion-led account is coordinating next-step expansion planning.",
+        )
+        return [
+            TeamsRecord(
+                teams_message_id=self._id(
+                    "teams_message",
+                    f"{scenario.event.id}:profile:champion",
+                ),
+                team_id=self._id("team", f"{scenario.event.id}:teams-team"),
+                channel_id=self._id("channel", f"{scenario.event.id}:teams-channel"),
+                chat_or_channel="channel",
+                thread_id=self._id("teams_thread", f"{scenario.event.id}:teams-thread"),
+                timestamp=scenario.event.ends_at + timedelta(hours=2, minutes=30),
+                sender_employee_id=organizer.id,
+                body=(
+                    "Task list:\n"
+                    "- capture the expansion owner\n"
+                    "- schedule the next champion check-in"
+                ),
+                mentions=[account_owner.id],
+                meeting_id=self._id("meeting", f"{scenario.event.id}:teams-meeting"),
+                file_refs=["expansion-plan.docx"],
+                linked_account_id=account.id,
+                linked_opportunity_id=opportunity.id,
+                linked_event_id=scenario.event.id,
+                linked_ticket_id=None,
+                primary_category=CommunicationCategory.FOLLOW_UP,
+                is_relevant=True,
+                relevance_reason=build_relevance_reason(
+                    primary_category=CommunicationCategory.FOLLOW_UP,
+                    is_relevant=True,
+                    provenance=provenance,
+                ),
+                provenance=provenance,
+                source_system="teams",
+            )
+        ]
+
+    def _profile_salesforce_records(
+        self,
+        *,
+        scenario: EventScenarioContext,
+        profile: AccountBehaviorProfile,
+    ) -> list[SalesforceRecord]:
+        if profile.profile_type != AccountBehaviorProfileType.HIGHLY_ENGAGED_CHAMPION_LED:
+            return []
+
+        opportunity = scenario.opportunity
+        account = scenario.account
+        account_owner = scenario.account_owner
+        if opportunity is None:
+            return []
+        provenance = LabelProvenance(
+            object_type=ProvenanceObjectType.OPPORTUNITY,
+            object_id=opportunity.id,
+            explanation="Champion-led account is logging fresh expansion interest.",
+        )
+        return [
+            SalesforceRecord(
+                salesforce_record_id=self._id(
+                    "sf_record",
+                    f"{scenario.event.id}:profile:champion-note",
+                ),
+                object_type=SalesforceObjectType.NOTE,
+                record_id=self._id("note", f"{scenario.event.id}:profile:champion-note"),
+                timestamp=scenario.event.ends_at + timedelta(hours=4),
+                owner_employee_id=account_owner.id,
+                account_id=account.id,
+                opportunity_id=opportunity.id,
+                event_id=scenario.event.id,
+                parent_record_id=opportunity.id,
+                subject="Champion follow-up note",
+                text_body="Champion asked for the expansion plan and next owner update.",
+                structured_fields={"activity_type": "Call Note"},
+                primary_category=CommunicationCategory.BUYING_SIGNAL,
+                is_relevant=True,
+                relevance_reason=build_relevance_reason(
+                    primary_category=CommunicationCategory.BUYING_SIGNAL,
+                    is_relevant=True,
+                    provenance=provenance,
+                ),
+                provenance=provenance,
+                source_system="salesforce",
+            )
+        ]
+
+    def _event_contacts(
+        self,
+        *,
+        event: Event,
+        account: CustomerAccount,
+    ) -> list[Contact]:
+        event_contact_ids = set(event.attendee_contact_ids)
+        account_contacts = [
+            contact
+            for contact in self.enterprise.contacts
+            if contact.account_id == account.id
+        ]
+        matched_contacts = [
+            contact
+            for contact in account_contacts
+            if contact.id in event_contact_ids
+        ]
+        return matched_contacts or account_contacts
 
     def _id(self, prefix: str, namespace: str) -> str:
         derived = self.context.derive_seed(f"cross-system:{namespace}")

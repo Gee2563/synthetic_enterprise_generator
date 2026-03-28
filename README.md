@@ -81,6 +81,22 @@ Core package areas:
 
 Detailed notes: [docs/architecture.md](/Users/teegsontech/synthetic_enterprise_generator/docs/architecture.md)
 
+## Phase 2 Improvements
+
+Phase 2 adds deeper scenario state, stronger company and persona differentiation, richer source realism, controlled messiness, lagged cross-system visibility, and dedicated realism benchmarks.
+
+Major additions:
+
+- Scenario Engine V2 with temporal business arcs and explicit state transitions
+- company language profiles and persona-aware voice variation
+- compositional email templates plus controlled paraphrases
+- deeper source-specific realism for email, Slack, Teams, and Salesforce
+- bounded messy-data behavior
+- cross-system lag and partial visibility
+- Phase 2 benchmark generation, Gold Set V2, and Phase 1 vs Phase 2 comparison reporting
+
+Detailed notes: [docs/phase2.md](/Users/teegsontech/synthetic_enterprise_generator/docs/phase2.md)
+
 ## Data Model Overview
 
 The simulator builds an `EnterpriseGraph` containing explicit relationships among:
@@ -306,6 +322,36 @@ Cross-system consistency example:
 
 More complete examples: [docs/examples.md](/Users/teegsontech/synthetic_enterprise_generator/docs/examples.md)
 
+## Benchmark Realism Improvements
+
+The dedicated Phase 2 benchmark is designed to stress realism instead of only volume. It combines:
+
+- at least 3 company profiles
+- all 4 source systems
+- explicit scenario-family coverage
+- richer thread behavior
+- hard negatives
+- messy-data cases
+- event-attendance edge cases
+- multiple account behavior profiles
+
+Current benchmarking workflow:
+
+1. generate a Phase 1-style baseline dataset
+2. generate the Phase 2 benchmark with `GenerationPipeline.generate_phase2_benchmark(...)`
+3. compute `QualityReport` outputs
+4. compare them with `PhaseMetricsComparator`
+
+The comparison workflow checks:
+
+- duplicate reduction
+- lexical diversity improvement
+- scenario coverage improvement
+- noise entropy improvement
+- thread-depth improvement
+
+Detailed notes: [docs/phase2.md](/Users/teegsontech/synthetic_enterprise_generator/docs/phase2.md)
+
 ## Limitations And Ethics
 
 - The generator aims for realism, not truth. It is useful for model development, not for measuring real-world business frequency.
@@ -320,6 +366,7 @@ Detailed notes: [docs/limitations.md](/Users/teegsontech/synthetic_enterprise_ge
 - [docs/README.md](/Users/teegsontech/synthetic_enterprise_generator/docs/README.md)
 - [docs/architecture.md](/Users/teegsontech/synthetic_enterprise_generator/docs/architecture.md)
 - [docs/data-model.md](/Users/teegsontech/synthetic_enterprise_generator/docs/data-model.md)
+- [docs/phase2.md](/Users/teegsontech/synthetic_enterprise_generator/docs/phase2.md)
 - [docs/grounding-and-noise.md](/Users/teegsontech/synthetic_enterprise_generator/docs/grounding-and-noise.md)
 - [docs/operations.md](/Users/teegsontech/synthetic_enterprise_generator/docs/operations.md)
 - [docs/examples.md](/Users/teegsontech/synthetic_enterprise_generator/docs/examples.md)

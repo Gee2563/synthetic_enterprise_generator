@@ -6,7 +6,11 @@ from pathlib import Path
 import pytest
 
 from synthetic_enterprise.domain import EnterpriseGraph
-from synthetic_enterprise.evaluation.quality_report import DatasetQualityEvaluator
+from synthetic_enterprise.evaluation.quality_report import (
+    QUALITY_METRIC_DEFINITIONS,
+    DatasetQualityEvaluator,
+)
+from synthetic_enterprise.generation.account_profiles import AccountBehaviorResolver
 from synthetic_enterprise.generation.company_builder import CompanyBuilder
 from synthetic_enterprise.generation.config import CompanySizeConfig, GeneratorConfig
 from synthetic_enterprise.generation.context import GeneratorContext
@@ -23,6 +27,16 @@ def build_enterprise() -> EnterpriseGraph:
     return CompanyBuilder().build(context, account_count=2)
 
 
+def build_phase2_enterprise() -> tuple[GeneratorContext, EnterpriseGraph]:
+    context = GeneratorContext(
+        seed=20260402,
+        config=GeneratorConfig(
+            company_size=CompanySizeConfig(min_employees=12, max_employees=12),
+        ),
+    )
+    return context, CompanyBuilder().build(context, account_count=7)
+
+
 def build_toy_rows(enterprise: EnterpriseGraph) -> dict[str, list[dict[str, object]]]:
     account = enterprise.customer_accounts[0]
     opportunity = enterprise.opportunities[0]
@@ -30,14 +44,17 @@ def build_toy_rows(enterprise: EnterpriseGraph) -> dict[str, list[dict[str, obje
     ticket = enterprise.ticket_issues[0]
     contact = enterprise.contacts[0]
     employee_ids = [employee.id for employee in enterprise.employees[:3]]
+    company_id = enterprise.companies[0].id
 
     return {
         "email": [
             {
                 "source_system": "email",
+                "company_id": company_id,
                 "email_id": "email_a",
                 "thread_id": "thread_a",
                 "message_index_in_thread": 0,
+                "timestamp": "2026-01-10T09:00:00+00:00",
                 "sender_employee_id": employee_ids[0],
                 "to": [contact.id],
                 "cc": [employee_ids[1]],
@@ -60,9 +77,11 @@ def build_toy_rows(enterprise: EnterpriseGraph) -> dict[str, list[dict[str, obje
             },
             {
                 "source_system": "email",
+                "company_id": company_id,
                 "email_id": "email_b",
                 "thread_id": "thread_a",
                 "message_index_in_thread": 1,
+                "timestamp": "2026-01-10T09:45:00+00:00",
                 "sender_employee_id": employee_ids[0],
                 "to": [contact.id],
                 "cc": [],
@@ -80,11 +99,13 @@ def build_toy_rows(enterprise: EnterpriseGraph) -> dict[str, list[dict[str, obje
         "slack": [
             {
                 "source_system": "slack",
+                "company_id": company_id,
                 "slack_message_id": "slack_message_a",
                 "channel_id": "channel_a",
                 "channel_name": "#watercooler",
                 "thread_id": None,
                 "parent_message_id": None,
+                "timestamp": "2026-01-10T08:30:00+00:00",
                 "sender_employee_id": employee_ids[2],
                 "body": "coffee after standup",
                 "mentions": [],
@@ -103,12 +124,14 @@ def build_toy_rows(enterprise: EnterpriseGraph) -> dict[str, list[dict[str, obje
         "teams": [
             {
                 "source_system": "teams",
+                "company_id": company_id,
                 "teams_message_id": "teams_message_a",
                 "team_id": "team_a",
                 "channel_id": "channel_b",
                 "chat_or_channel": "channel",
                 "thread_id": None,
                 "meeting_id": "meeting_a",
+                "timestamp": "2026-01-10T10:00:00+00:00",
                 "sender_employee_id": employee_ids[1],
                 "body": "Budget review covers room block, not customer spend.",
                 "mentions": [employee_ids[0]],
@@ -131,9 +154,11 @@ def build_toy_rows(enterprise: EnterpriseGraph) -> dict[str, list[dict[str, obje
         "salesforce": [
             {
                 "source_system": "salesforce",
+                "company_id": company_id,
                 "salesforce_record_id": "sf_record_a",
                 "object_type": "Event",
                 "record_id": event.id,
+                "timestamp": "2026-01-10T12:00:00+00:00",
                 "owner_employee_id": employee_ids[0],
                 "account_id": account.id,
                 "event_id": event.id,
@@ -177,7 +202,17 @@ def test_quality_metrics_compute_on_toy_dataset() -> None:
     assert report.cross_system_linkage_rate > 0.5
     assert report.hard_negative_rate == pytest.approx(0.2)
     assert report.duplicate_rate == pytest.approx(0.0)
+    assert report.duplicate_rate_by_source["email"] == pytest.approx(0.0)
     assert report.lexical_diversity > 0.5
+    assert report.lexical_diversity_by_source["email"] > 0.5
+    assert report.lexical_diversity_by_company[enterprise.companies[0].id] > 0.5
+    assert report.source_style_separation_proxy > 0.5
+    assert report.hard_negative_difficulty_proxy > 0.0
+    assert report.noise_family_entropy > 0.9
+    assert report.temporal_lag_distribution["0-6h"] > 0
+    assert report.messy_data_rate == pytest.approx(0.0)
+    assert report.scenario_coverage.overall_rate == pytest.approx(0.0)
+    assert report.account_profile_coverage.overall_rate == pytest.approx(0.0)
     assert report.entity_coverage.overall_rate > 0.0
 
 
@@ -199,6 +234,35 @@ def test_quality_metrics_compute_on_toy_dataset() -> None:
                 ]
             },
             "unsupported source",
+        ),
+            (
+                {
+                    "email": [
+                        {
+                            "source_system": "email",
+                            "thread_id": "thread_bad",
+                            "primary_category": "follow_up",
+                            "is_relevant": True,
+                            "company_id": 123,
+                        }
+                    ]
+            },
+            "company_id must be a string when provided",
+        ),
+            (
+                {
+                    "email": [
+                        {
+                            "source_system": "email",
+                            "thread_id": "thread_bad",
+                            "primary_category": "follow_up",
+                            "is_relevant": True,
+                            "company_id": "company_bad",
+                            "timestamp": "not-a-timestamp",
+                    }
+                ]
+            },
+            "timestamp must be an ISO datetime string",
         ),
     ],
 )
@@ -224,11 +288,26 @@ def test_quality_report_structure_is_stable() -> None:
         "average_message_length_by_source",
         "cross_system_linkage_rate",
         "hard_negative_rate",
+        "messy_data_rate",
         "duplicate_rate",
+        "duplicate_rate_by_source",
         "lexical_diversity",
+        "lexical_diversity_by_source",
+        "lexical_diversity_by_company",
+        "scenario_coverage",
+        "source_style_separation_proxy",
+        "hard_negative_difficulty_proxy",
+        "noise_family_entropy",
+        "temporal_lag_distribution",
+        "account_profile_coverage",
         "entity_coverage",
     ]
+    assert set(report.to_dict()) <= set(QUALITY_METRIC_DEFINITIONS)
+    assert QUALITY_METRIC_DEFINITIONS["source_style_separation_proxy"]
+    assert QUALITY_METRIC_DEFINITIONS["scenario_coverage"]
     assert list(report.entity_coverage.to_dict()) == ["overall_rate", "by_entity_type"]
+    assert list(report.scenario_coverage.to_dict()) == ["overall_rate", "by_family"]
+    assert list(report.account_profile_coverage.to_dict()) == ["overall_rate", "by_profile"]
 
 
 def test_quality_metrics_distinguish_degenerate_datasets_from_realistic_ones(
@@ -281,4 +360,84 @@ def test_quality_metrics_distinguish_degenerate_datasets_from_realistic_ones(
     assert (
         degenerate_report.entity_coverage.overall_rate
         < realistic_report.entity_coverage.overall_rate
+    )
+    assert (
+        degenerate_report.duplicate_rate_by_source["email"]
+        > realistic_report.duplicate_rate_by_source["email"]
+    )
+    assert (
+        degenerate_report.source_style_separation_proxy
+        < realistic_report.source_style_separation_proxy
+    )
+    assert (
+        degenerate_report.noise_family_entropy
+        < realistic_report.noise_family_entropy
+    )
+
+
+def test_phase2_metrics_compute_on_toy_dataset_with_context() -> None:
+    context, enterprise = build_phase2_enterprise()
+    rows_by_source = build_toy_rows(enterprise)
+    account_profiles = AccountBehaviorResolver(context=context, enterprise=enterprise)
+    first_account = enterprise.customer_accounts[0]
+    profile_value = account_profiles.profile_for_account(first_account.id).profile_type.value
+
+    for source_rows in rows_by_source.values():
+        for row in source_rows:
+            if (
+                row.get("account_id") == first_account.id
+                or row.get("linked_account_id") == first_account.id
+            ):
+                row["account_behavior_profile"] = profile_value
+
+    report = DatasetQualityEvaluator(enterprise=enterprise, context=context).evaluate(
+        rows_by_source
+    )
+
+    assert report.scenario_coverage.overall_rate > 0.0
+    assert report.scenario_coverage.by_family["event_invite_to_attendance"] > 0.0
+    assert report.account_profile_coverage.overall_rate > 0.0
+    assert report.account_profile_coverage.by_profile[profile_value] > 0.0
+    assert report.temporal_lag_distribution["0-6h"] >= 1
+
+
+def test_phase2_metrics_make_regressions_visible_between_phase1_and_phase2() -> None:
+    context, enterprise = build_phase2_enterprise()
+    phase2_rows = build_toy_rows(enterprise)
+    phase1_rows = {
+        "email": [
+            {
+                **deepcopy(phase2_rows["email"][0]),
+                "email_id": f"email_phase1_{index}",
+                "thread_id": f"thread_phase1_{index}",
+                "body": "follow up after review",
+                "subject": "follow up",
+                "timestamp": "2026-01-10T09:00:00+00:00",
+            }
+            for index in range(6)
+        ],
+        "slack": [],
+        "teams": [],
+        "salesforce": [],
+    }
+
+    phase1_report = DatasetQualityEvaluator(enterprise=enterprise, context=context).evaluate(
+        phase1_rows
+    )
+    phase2_report = DatasetQualityEvaluator(enterprise=enterprise, context=context).evaluate(
+        phase2_rows
+    )
+
+    assert (
+        phase1_report.duplicate_rate_by_source["email"]
+        > phase2_report.duplicate_rate_by_source["email"]
+    )
+    assert (
+        phase1_report.lexical_diversity_by_source["email"]
+        < phase2_report.lexical_diversity_by_source["email"]
+    )
+    assert phase1_report.source_style_separation_proxy < phase2_report.source_style_separation_proxy
+    assert (
+        phase1_report.hard_negative_difficulty_proxy
+        < phase2_report.hard_negative_difficulty_proxy
     )

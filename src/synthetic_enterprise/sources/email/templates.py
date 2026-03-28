@@ -7,6 +7,19 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
 from synthetic_enterprise.generation.context import GeneratorContext
+from synthetic_enterprise.generation.personas import (
+    PersonaVoiceProfile,
+    resolve_persona_voice_profile,
+)
+from synthetic_enterprise.sources.email.composition import (
+    CompositionalTemplateEngine,
+    TemplateBlock,
+    TemplatePlan,
+)
+from synthetic_enterprise.sources.email.paraphrases import (
+    EmailParaphraseBlock,
+    SafeEmailParaphraser,
+)
 
 NonEmptyText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
@@ -51,6 +64,10 @@ class EmailStyleRequest(BaseModel):
     cc: tuple[str, ...] = ()
     bcc: tuple[str, ...] = ()
     context_lines: tuple[NonEmptyText, ...] = ()
+    prior_thread_summary: NonEmptyText | None = None
+    objection_line: NonEmptyText | None = None
+    action_ask: NonEmptyText | None = None
+    disclaimer_line: NonEmptyText | None = None
 
 
 class StyledEmailContent(BaseModel):
@@ -76,13 +93,14 @@ class EmailStyleEngine:
     def render(self, request: EmailStyleRequest) -> StyledEmailContent:
         subject = self._render_subject(request)
         greeting = self._render_greeting(request)
-        opener = self._render_opener(request)
-        detail_lines = self._render_detail_lines(request)
+        sections = self._render_sections(request)
         signature = self._render_signature(request)
 
-        body_parts = [greeting, "", opener]
-        if detail_lines:
-            body_parts.extend(["", *detail_lines])
+        body_parts = [greeting]
+        if sections:
+            body_parts.extend(["", sections[0]])
+            if len(sections) > 1:
+                body_parts.extend(["", *sections[1:]])
         if signature is not None:
             body_parts.extend(["", signature])
 
@@ -115,102 +133,265 @@ class EmailStyleEngine:
         return self._pick(salt="greeting:ic", options=("Hi team,", "Hi all,"))
 
     def _render_opener(self, request: EmailStyleRequest) -> str:
+        profile = self._voice_profile(request)
         if request.audience == EmailAudience.EXTERNAL_CUSTOMER:
             return self._pick(
-                salt="opener:external",
-                options=(
-                    "Thanks again for the time today.",
-                    "Thanks again for the discussion today.",
-                ),
-            )
-        if request.seniority == EmailSeniority.EXECUTIVE:
-            return self._pick(
-                salt="opener:exec",
-                options=(
-                    "At a high level, we need to keep this moving.",
-                    "At a high level, let's keep this moving.",
-                ),
+                salt=f"opener:{profile.key}:external",
+                options=profile.external_openers,
             )
         return self._pick(
-            salt="opener:ic",
-            options=(
-                "I pulled together the details below.",
-                "I captured the details below.",
-            ),
+            salt=f"opener:{profile.key}:internal",
+            options=profile.internal_openers,
         )
 
-    def _render_detail_lines(self, request: EmailStyleRequest) -> list[str]:
+    def _render_sections(self, request: EmailStyleRequest) -> list[str]:
+        profile = self._voice_profile(request)
         if request.detail_level == EmailDetailLevel.SHORT:
-            return [self._render_short_acknowledgement(request)]
+            sections = [self._render_short_acknowledgement(request)]
+            if request.action_ask is not None:
+                sections.append(self._render_action_ask(request))
+            if request.disclaimer_line is not None:
+                sections.append(self._render_disclaimer(request))
+            return sections
 
-        lines = list(request.context_lines) or [self._render_default_detail_line(request)]
-        if self.context.seed % 2 == 1:
-            lines.reverse()
-
-        detailed_lines = [self._prefix_detail_line(index, line) for index, line in enumerate(lines)]
-        detailed_lines.append(self._render_closing_line(request))
-        return detailed_lines
+        plan = self._build_plan(request=request, profile=profile)
+        return CompositionalTemplateEngine(context=self.context).render(plan)
 
     def _render_short_acknowledgement(self, request: EmailStyleRequest) -> str:
+        profile = self._voice_profile(request)
         if request.audience == EmailAudience.EXTERNAL_CUSTOMER:
             return self._pick(
-                salt="ack:external",
-                options=(
-                    "A quick summary is below, and we're aligned on the next step.",
-                    "Sharing the short version here so we stay aligned on timing.",
-                ),
-            )
-        if request.seniority == EmailSeniority.EXECUTIVE:
-            return self._pick(
-                salt="ack:exec",
-                options=(
-                    "Please keep the owners clear and keep this moving.",
-                    "Please keep timing tight and close the loop quickly.",
-                ),
+                salt=f"ack:{profile.key}:external",
+                options=profile.external_short_acks,
             )
         return self._pick(
-            salt="ack:ic",
-            options=(
-                "Quick note below so we're aligned on next steps.",
-                "Sending the short version here to keep everyone aligned.",
-            ),
+            salt=f"ack:{profile.key}:internal",
+            options=profile.internal_short_acks,
         )
 
     def _render_default_detail_line(self, request: EmailStyleRequest) -> str:
         if request.audience == EmailAudience.EXTERNAL_CUSTOMER:
-            return "We will send a written summary and timing update after the meeting."
-        if request.seniority == EmailSeniority.EXECUTIVE:
-            return "Please keep the timeline, owners, and open decisions visible."
-        return "I've outlined the current tasks, timing, and open questions below."
-
-    def _prefix_detail_line(self, index: int, line: str) -> str:
-        prefixes = ("First,", "Also,", "Separately,", "Finally,")
-        prefix = prefixes[index % len(prefixes)]
-        return f"{prefix} {line}"
+            return self._voice_profile(request).external_default_detail
+        return self._voice_profile(request).internal_default_detail
 
     def _render_closing_line(self, request: EmailStyleRequest) -> str:
+        profile = self._voice_profile(request)
         if request.audience == EmailAudience.EXTERNAL_CUSTOMER:
             return self._pick(
-                salt="closing:external",
-                options=(
-                    "Please let me know if you'd like us to adjust anything on our side.",
-                    "If anything should be revised on our side, please send it over.",
-                ),
-            )
-        if request.seniority == EmailSeniority.EXECUTIVE:
-            return self._pick(
-                salt="closing:exec",
-                options=(
-                    "Let's keep the decision path simple from here.",
-                    "Let's keep the owners and timing clean from here.",
-                ),
+                salt=f"closing:{profile.key}:external",
+                options=profile.external_closings,
             )
         return self._pick(
-            salt="closing:ic",
-            options=(
-                "If I missed anything, reply back and I'll update the summary.",
-                "If anything looks off, send it back and I'll adjust the detail.",
+            salt=f"closing:{profile.key}:internal",
+            options=profile.internal_closings,
+        )
+
+    def _build_plan(
+        self,
+        *,
+        request: EmailStyleRequest,
+        profile: PersonaVoiceProfile,
+    ) -> TemplatePlan:
+        context_lines = list(request.context_lines) or [self._render_default_detail_line(request)]
+        core_keys = [f"core_{index}" for index in range(len(context_lines))]
+        ordered_keys = tuple(
+            key
+            for key in (
+                "opening",
+                "prior_thread",
+                *core_keys,
+                "objection",
+                "action",
+                "closing",
+                "disclaimer",
+            )
+            if key == "opening"
+            or (key == "prior_thread" and request.prior_thread_summary is not None)
+            or (key.startswith("core_"))
+            or (key == "objection" and request.objection_line is not None)
+            or (key == "action" and request.action_ask is not None)
+            or key == "closing"
+            or (key == "disclaimer" and request.disclaimer_line is not None)
+        )
+        reverse_core_keys = tuple(reversed(core_keys))
+        order_variants = (
+            ordered_keys,
+            tuple(
+                key
+                for key in (
+                    "opening",
+                    *reverse_core_keys,
+                    "prior_thread",
+                    "action",
+                    "objection",
+                    "closing",
+                    "disclaimer",
+                )
+                if key in ordered_keys
             ),
+            tuple(
+                key
+                for key in (
+                    "opening",
+                    "objection",
+                    "action",
+                    *core_keys,
+                    "prior_thread",
+                    "disclaimer",
+                    "closing",
+                )
+                if key in ordered_keys
+            ),
+        )
+        blocks = [
+            TemplateBlock(
+                key="opening",
+                variants=self._opening_variants(request),
+            ),
+        ]
+        if request.prior_thread_summary is not None:
+            blocks.append(
+                TemplateBlock(
+                    key="prior_thread",
+                    variants=self._prior_thread_variants(request.prior_thread_summary),
+                )
+            )
+        for index, line in enumerate(context_lines):
+            blocks.append(
+                TemplateBlock(
+                    key=f"core_{index}",
+                    variants=self._core_clause_variants(
+                        line=line,
+                        prefix=profile.detail_prefixes[index % len(profile.detail_prefixes)],
+                    ),
+                )
+            )
+        if request.objection_line is not None:
+            blocks.append(
+                TemplateBlock(
+                    key="objection",
+                    variants=self._objection_variants(request.objection_line),
+                )
+            )
+        if request.action_ask is not None:
+            blocks.append(
+                TemplateBlock(
+                    key="action",
+                    variants=self._action_variants(request.action_ask),
+                )
+            )
+        blocks.append(
+            TemplateBlock(
+                key="closing",
+                variants=(self._render_closing_line(request),),
+            )
+        )
+        if request.disclaimer_line is not None:
+            blocks.append(
+                TemplateBlock(
+                    key="disclaimer",
+                    variants=self._disclaimer_variants(request.disclaimer_line),
+                )
+            )
+
+        return TemplatePlan(
+            blocks=tuple(blocks),
+            order_variants=order_variants,
+        )
+
+    def _opening_variants(self, request: EmailStyleRequest) -> tuple[str, ...]:
+        opener = self._render_opener(request)
+        variants = [opener]
+        if request.audience == EmailAudience.EXTERNAL_CUSTOMER:
+            variants.append(f"{opener} I pulled the key notes together below.")
+            variants.append(f"{opener} I captured the main points below.")
+        else:
+            variants.append(f"{opener} I pulled the key notes together below.")
+            variants.append(f"{opener} I captured the main points below.")
+        return tuple(dict.fromkeys(variants))
+
+    def _prior_thread_variants(self, summary: str) -> tuple[str, ...]:
+        return self._paraphrase_variants(
+            key="prior_thread",
+            templates=(
+                "Prior thread: {summary}",
+                "From the earlier thread: {summary}",
+                "Carrying forward the earlier thread, {summary_lower}",
+            ),
+            facts={
+                "summary": summary,
+                "summary_lower": self._lowercase_first(summary),
+            },
+        )
+
+    def _core_clause_variants(
+        self,
+        *,
+        line: str,
+        prefix: str,
+    ) -> tuple[str, ...]:
+        return self._paraphrase_variants(
+            key=f"core:{prefix}",
+            templates=(
+                "{prefix} {line}",
+                "{prefix} Right now, {line_lower}",
+                "{prefix} For this thread, {line_lower}",
+            ),
+            facts={
+                "prefix": prefix,
+                "line": line,
+                "line_lower": self._lowercase_first(line),
+            },
+        )
+
+    def _objection_variants(self, line: str) -> tuple[str, ...]:
+        return self._paraphrase_variants(
+            key="objection",
+            templates=(
+                "Objection: {line}",
+                "Constraint: {line}",
+                "Current pushback: {line_lower}",
+            ),
+            facts={
+                "line": line,
+                "line_lower": self._lowercase_first(line),
+            },
+        )
+
+    def _render_action_ask(self, request: EmailStyleRequest) -> str:
+        assert request.action_ask is not None
+        return self._action_variants(request.action_ask)[0]
+
+    def _action_variants(self, line: str) -> tuple[str, ...]:
+        return self._paraphrase_variants(
+            key="action",
+            templates=(
+                "Action ask: {line}",
+                "Next step: {line}",
+                "Please note: {line_lower}",
+            ),
+            facts={
+                "line": line,
+                "line_lower": self._lowercase_first(line),
+            },
+        )
+
+    def _render_disclaimer(self, request: EmailStyleRequest) -> str:
+        assert request.disclaimer_line is not None
+        return self._disclaimer_variants(request.disclaimer_line)[0]
+
+    def _disclaimer_variants(self, line: str) -> tuple[str, ...]:
+        return self._paraphrase_variants(
+            key="disclaimer",
+            templates=(
+                "Planning note: {line}",
+                "Context only: {line}",
+                "Disclaimer: {line_lower}",
+            ),
+            facts={
+                "line": line,
+                "line_lower": self._lowercase_first(line),
+            },
         )
 
     def _render_signature(self, request: EmailStyleRequest) -> str | None:
@@ -228,3 +409,29 @@ class EmailStyleEngine:
     def _pick(self, *, salt: str, options: tuple[str, ...]) -> str:
         index = (self.context.seed + self.context.derive_seed(salt)) % len(options)
         return options[index]
+
+    def _voice_profile(self, request: EmailStyleRequest) -> PersonaVoiceProfile:
+        return resolve_persona_voice_profile(
+            sender_role=request.sender_role,
+            seniority=request.seniority.value,
+        )
+
+    def _paraphrase_variants(
+        self,
+        *,
+        key: str,
+        templates: tuple[str, ...],
+        facts: dict[str, str],
+    ) -> tuple[str, ...]:
+        return SafeEmailParaphraser(context=self.context).render_all(
+            EmailParaphraseBlock(
+                key=key,
+                templates=templates,
+                facts=facts,
+            )
+        )
+
+    def _lowercase_first(self, text: str) -> str:
+        if not text:
+            return text
+        return text[0].lower() + text[1:]

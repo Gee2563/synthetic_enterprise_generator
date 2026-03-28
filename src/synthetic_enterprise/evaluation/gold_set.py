@@ -14,6 +14,7 @@ from synthetic_enterprise.evaluation.quality_report import (
     SUPPORTED_SOURCES,
     _business_entity_ids,
     _entity_references,
+    _is_messy_row,
     _provenance_strength,
     _required_value,
     _row_to_dict,
@@ -49,6 +50,15 @@ class GoldSetConfig(EnterpriseModel):
                 f"relevant_categories must only contain relevant labels: {invalid}"
             )
         return self
+
+
+class GoldSetV2Config(GoldSetConfig):
+    """Phase 2 gold-set configuration with stronger realism constraints."""
+
+    min_sources: int = Field(default=4, ge=1)
+    min_companies: int = Field(default=3, ge=1)
+    min_messy_examples: int = Field(default=1, ge=0)
+    min_event_attendance_edge_cases: int = Field(default=1, ge=0)
 
 
 class GoldExample(EnterpriseModel):
@@ -95,6 +105,9 @@ class _GoldCandidate:
     cross_system_group_id: str | None
     referenced_entity_ids: tuple[str, ...]
     row_data: dict[str, Any]
+    company_id: str | None
+    is_messy: bool
+    is_event_attendance_edge_case: bool
     reference_error: str | None = None
 
     @property
@@ -206,6 +219,131 @@ class GoldSetBuilder:
 
         return GoldSet(config=config, examples=examples)
 
+    def create_v2(
+        self,
+        *,
+        rows_by_source: Mapping[str, Sequence[RowLike]],
+        config: GoldSetV2Config,
+    ) -> GoldSet:
+        candidates = self._normalize_candidates(rows_by_source)
+        selected: list[_GoldCandidate] = []
+        selected_keys: set[tuple[str, str]] = set()
+        source_counts: defaultdict[str, int] = defaultdict(int)
+        company_counts: defaultdict[str, int] = defaultdict(int)
+
+        for category in config.relevant_categories:
+            available = [
+                candidate
+                for candidate in candidates
+                if candidate.primary_category == category
+                and candidate.is_relevant
+                and not candidate.is_hard_negative
+                and candidate.reference_error is None
+            ]
+            chosen = self._balanced_pick(
+                available=available,
+                count=config.samples_per_relevant_category,
+                selected=selected,
+                selected_keys=selected_keys,
+                source_counts=source_counts,
+                company_counts=company_counts,
+            )
+            if len(chosen) < config.samples_per_relevant_category:
+                raise ValueError(f"not enough clean candidates for category {category.value}")
+
+        hard_negative_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.is_hard_negative
+            and candidate.reference_error is None
+        ]
+        chosen_hard_negatives = self._balanced_pick(
+            available=hard_negative_candidates,
+            count=config.hard_negative_count,
+            selected=selected,
+            selected_keys=selected_keys,
+            source_counts=source_counts,
+            company_counts=company_counts,
+        )
+        if len(chosen_hard_negatives) < config.hard_negative_count:
+            raise ValueError("not enough hard-negative candidates for the requested gold set")
+
+        self._ensure_minimum_examples(
+            selected=selected,
+            selected_keys=selected_keys,
+            source_counts=source_counts,
+            company_counts=company_counts,
+            candidates=candidates,
+            required_count=config.min_messy_examples,
+            current_count=sum(candidate.is_messy for candidate in selected),
+            predicate=lambda candidate: candidate.is_messy,
+            error_message="not enough messy examples for Gold Set V2",
+        )
+        self._ensure_minimum_examples(
+            selected=selected,
+            selected_keys=selected_keys,
+            source_counts=source_counts,
+            company_counts=company_counts,
+            candidates=candidates,
+            required_count=config.min_event_attendance_edge_cases,
+            current_count=sum(candidate.is_event_attendance_edge_case for candidate in selected),
+            predicate=lambda candidate: candidate.is_event_attendance_edge_case,
+            error_message="not enough event-attendance edge cases for Gold Set V2",
+        )
+        self._ensure_minimum_examples(
+            selected=selected,
+            selected_keys=selected_keys,
+            source_counts=source_counts,
+            company_counts=company_counts,
+            candidates=candidates,
+            required_count=config.min_cross_system_examples,
+            current_count=sum(
+                candidate.cross_system_group_id is not None
+                for candidate in selected
+            ),
+            predicate=lambda candidate: candidate.cross_system_group_id is not None,
+            error_message="not enough cross-system linked candidates for Gold Set V2",
+        )
+        self._ensure_source_diversity(
+            selected=selected,
+            selected_keys=selected_keys,
+            source_counts=source_counts,
+            company_counts=company_counts,
+            candidates=candidates,
+            min_sources=config.min_sources,
+        )
+        self._ensure_company_diversity(
+            selected=selected,
+            selected_keys=selected_keys,
+            source_counts=source_counts,
+            company_counts=company_counts,
+            candidates=candidates,
+            min_companies=config.min_companies,
+        )
+
+        return GoldSet(
+            config=config,
+            examples=[
+                GoldExample(
+                    gold_example_id=stable_entity_id(
+                        "gold_example",
+                        0,
+                        f"{candidate.source_system}:{candidate.source_row_id}",
+                    ),
+                    source_system=candidate.source_system,
+                    source_row_id=candidate.source_row_id,
+                    primary_category=candidate.primary_category,
+                    is_relevant=candidate.is_relevant,
+                    is_hard_negative=candidate.is_hard_negative,
+                    rationale=candidate.rationale,
+                    cross_system_group_id=candidate.cross_system_group_id,
+                    referenced_entity_ids=candidate.referenced_entity_ids,
+                    row_data=candidate.row_data,
+                )
+                for candidate in selected
+            ],
+        )
+
     def export(
         self,
         *,
@@ -286,6 +424,16 @@ class GoldSetBuilder:
                         )
                     ),
                     row_data=payload,
+                    company_id=(
+                        str(payload["company_id"])
+                        if isinstance(payload.get("company_id"), str)
+                        else None
+                    ),
+                    is_messy=_is_messy_row(str(payload["source_system"]), payload),
+                    is_event_attendance_edge_case=self._is_event_attendance_edge_case(
+                        payload=payload,
+                        category=category,
+                    ),
                     reference_error=reference_error,
                 )
             )
@@ -354,3 +502,198 @@ class GoldSetBuilder:
         if provenance_strength == "weak":
             return f"Hard negative because {raw_reason}"
         return f"Non-relevant because {raw_reason}"
+
+    def _balanced_pick(
+        self,
+        *,
+        available: Sequence[_GoldCandidate],
+        count: int,
+        selected: list[_GoldCandidate],
+        selected_keys: set[tuple[str, str]],
+        source_counts: defaultdict[str, int],
+        company_counts: defaultdict[str, int],
+    ) -> list[_GoldCandidate]:
+        chosen: list[_GoldCandidate] = []
+
+        while len(chosen) < count:
+            remaining = [
+                candidate
+                for candidate in available
+                if (candidate.source_system, candidate.source_row_id) not in selected_keys
+            ]
+            if not remaining:
+                break
+
+            candidate = min(
+                remaining,
+                key=lambda item: (
+                    source_counts[item.source_system],
+                    company_counts[item.company_id or ""],
+                    0 if item.cross_system_group_id is not None else 1,
+                    0 if item.is_event_attendance_edge_case else 1,
+                    0 if item.is_messy else 1,
+                    item.source_system,
+                    item.company_id or "",
+                    item.source_row_id,
+                ),
+            )
+            chosen.append(candidate)
+            selected.append(candidate)
+            selected_keys.add((candidate.source_system, candidate.source_row_id))
+            source_counts[candidate.source_system] += 1
+            if candidate.company_id is not None:
+                company_counts[candidate.company_id] += 1
+
+        return chosen
+
+    def _ensure_minimum_examples(
+        self,
+        *,
+        selected: list[_GoldCandidate],
+        selected_keys: set[tuple[str, str]],
+        source_counts: defaultdict[str, int],
+        company_counts: defaultdict[str, int],
+        candidates: Sequence[_GoldCandidate],
+        required_count: int,
+        current_count: int,
+        predicate: Any,
+        error_message: str,
+    ) -> None:
+        if current_count >= required_count:
+            return
+
+        added = self._balanced_pick(
+            available=[
+                candidate
+                for candidate in candidates
+                if candidate.reference_error is None and predicate(candidate)
+            ],
+            count=required_count - current_count,
+            selected=selected,
+            selected_keys=selected_keys,
+            source_counts=source_counts,
+            company_counts=company_counts,
+        )
+        if len(added) < required_count - current_count:
+            raise ValueError(error_message)
+
+    def _ensure_source_diversity(
+        self,
+        *,
+        selected: list[_GoldCandidate],
+        selected_keys: set[tuple[str, str]],
+        source_counts: defaultdict[str, int],
+        company_counts: defaultdict[str, int],
+        candidates: Sequence[_GoldCandidate],
+        min_sources: int,
+    ) -> None:
+        represented_sources = {candidate.source_system for candidate in selected}
+        if len(represented_sources) >= min_sources:
+            return
+
+        missing_sources = [
+            source_name
+            for source_name in SUPPORTED_SOURCES
+            if source_name not in represented_sources
+        ]
+        for source_name in missing_sources:
+            source_candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.reference_error is None
+                and candidate.source_system == source_name
+            ]
+            added = self._balanced_pick(
+                available=self._prefer_non_relevant(source_candidates),
+                count=1,
+                selected=selected,
+                selected_keys=selected_keys,
+                source_counts=source_counts,
+                company_counts=company_counts,
+            )
+            if not added:
+                raise ValueError("not enough source diversity for Gold Set V2")
+            if len({candidate.source_system for candidate in selected}) >= min_sources:
+                break
+
+    def _ensure_company_diversity(
+        self,
+        *,
+        selected: list[_GoldCandidate],
+        selected_keys: set[tuple[str, str]],
+        source_counts: defaultdict[str, int],
+        company_counts: defaultdict[str, int],
+        candidates: Sequence[_GoldCandidate],
+        min_companies: int,
+    ) -> None:
+        represented_companies = {
+            candidate.company_id
+            for candidate in selected
+            if candidate.company_id is not None
+        }
+        if len(represented_companies) >= min_companies:
+            return
+
+        available_company_ids = sorted(
+            {
+                candidate.company_id
+                for candidate in candidates
+                if candidate.company_id is not None
+            }
+        )
+        for company_id in available_company_ids:
+            if company_id in represented_companies:
+                continue
+            company_candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.reference_error is None
+                and candidate.company_id == company_id
+            ]
+            added = self._balanced_pick(
+                available=self._prefer_non_relevant(company_candidates),
+                count=1,
+                selected=selected,
+                selected_keys=selected_keys,
+                source_counts=source_counts,
+                company_counts=company_counts,
+            )
+            if not added:
+                raise ValueError("not enough company diversity for Gold Set V2")
+            represented_companies.add(company_id)
+            if len(represented_companies) >= min_companies:
+                break
+
+    def _is_event_attendance_edge_case(
+        self,
+        *,
+        payload: Mapping[str, Any],
+        category: CommunicationCategory,
+    ) -> bool:
+        if category != CommunicationCategory.EVENT_ATTENDANCE:
+            return False
+
+        text = " ".join(
+            str(value).lower()
+            for value in (
+                payload.get("subject"),
+                payload.get("body"),
+                payload.get("text_body"),
+                payload.get("relevance_reason"),
+                payload.get("status"),
+            )
+            if isinstance(value, str)
+        )
+        return any(
+            token in text
+            for token in ("missed", "no show", "no_show", "tentative", "joined")
+        )
+
+    def _prefer_non_relevant(
+        self,
+        candidates: Sequence[_GoldCandidate],
+    ) -> list[_GoldCandidate]:
+        non_relevant = [candidate for candidate in candidates if not candidate.is_relevant]
+        if non_relevant:
+            return non_relevant
+        return list(candidates)

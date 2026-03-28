@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from synthetic_enterprise.generation.language_profiles import CompanyLanguageProfileType
 
 
 def _default_start_at() -> datetime:
@@ -57,8 +60,12 @@ class GeneratorConfig:
     timezone: str = "UTC"
     noise_ratio: float = 0.8
     hard_negative_ratio: float = 0.25
+    hard_negative_family_weights: Mapping[str, float] | None = None
     cross_system_ratio: float = 0.5
     verbosity_ratio: float = 0.5
+    noise_family_weights: Mapping[str, float] | None = None
+    messiness_rate: float = 0.0
+    company_language_profile: CompanyLanguageProfileType | None = None
 
     def __post_init__(self) -> None:
         if not self.locale.strip():
@@ -67,10 +74,18 @@ class GeneratorConfig:
             raise ValueError("noise_ratio must be between 0.0 and 1.0")
         if not 0.0 <= self.hard_negative_ratio <= 1.0:
             raise ValueError("hard_negative_ratio must be between 0.0 and 1.0")
+        if self.hard_negative_family_weights is not None:
+            if any(weight < 0.0 for weight in self.hard_negative_family_weights.values()):
+                raise ValueError("hard_negative_family_weights must be non-negative")
         if not 0.0 <= self.cross_system_ratio <= 1.0:
             raise ValueError("cross_system_ratio must be between 0.0 and 1.0")
         if not 0.0 <= self.verbosity_ratio <= 1.0:
             raise ValueError("verbosity_ratio must be between 0.0 and 1.0")
+        if self.noise_family_weights is not None:
+            if any(weight < 0.0 for weight in self.noise_family_weights.values()):
+                raise ValueError("noise_family_weights must be non-negative")
+        if not 0.0 <= self.messiness_rate <= 1.0:
+            raise ValueError("messiness_rate must be between 0.0 and 1.0")
 
         try:
             ZoneInfo(self.timezone)

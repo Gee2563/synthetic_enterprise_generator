@@ -6,15 +6,27 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, TypeAlias, TypeVar, cast
 
-from synthetic_enterprise.contracts.manifest import DatasetManifest
+from synthetic_enterprise.contracts.manifest import (
+    DatasetManifest,
+    Phase2BenchmarkManifest,
+)
 from synthetic_enterprise.contracts.records.email import EmailRecord
 from synthetic_enterprise.contracts.records.salesforce import SalesforceRecord
 from synthetic_enterprise.contracts.records.slack import SlackRecord
 from synthetic_enterprise.contracts.records.teams import TeamsRecord
+from synthetic_enterprise.contracts.scenario import ScenarioFamily
 from synthetic_enterprise.domain import EnterpriseGraph, Event
+from synthetic_enterprise.generation.account_profiles import AccountBehaviorResolver
 from synthetic_enterprise.generation.company_builder import CompanyBuilder
 from synthetic_enterprise.generation.context import GeneratorContext
 from synthetic_enterprise.generation.cross_system import CrossSystemEventBundle, CrossSystemRenderer
+from synthetic_enterprise.generation.language_profiles import (
+    CompanyLanguageProfile,
+    CompanyLanguageProfileType,
+    resolve_company_language_profile,
+)
+from synthetic_enterprise.generation.scenario_engine import ScenarioEngine
+from synthetic_enterprise.labeling.taxonomy import CommunicationCategory
 from synthetic_enterprise.sources.email.renderer import EmailRenderer
 from synthetic_enterprise.sources.salesforce.renderer import SalesforceRenderer
 from synthetic_enterprise.sources.slack.renderer import SlackRenderer
@@ -96,6 +108,67 @@ class StreamedGeneratedDataset:
     cross_system_bundles: list[CrossSystemEventBundle]
     manifests: dict[str, DatasetManifest]
     chunk_plans: dict[str, list[ChunkPlan]]
+
+
+@dataclass(frozen=True, slots=True)
+class MultiCompanyBenchmarkTargets:
+    """Configuration for generating several isolated companies in one benchmark."""
+
+    company_count: int = 3
+    per_company_targets: DatasetTargets = field(default_factory=DatasetTargets)
+
+    def __post_init__(self) -> None:
+        if self.company_count <= 0:
+            raise ValueError("company_count must be greater than zero")
+        if self.company_count > len(CompanyLanguageProfileType):
+            raise ValueError("company_count cannot exceed available company language profiles")
+
+
+@dataclass(slots=True)
+class MultiCompanyGeneratedDataset:
+    """Combined benchmark dataset spanning multiple companies."""
+
+    enterprise: EnterpriseGraph
+    company_profiles: dict[str, CompanyLanguageProfileType]
+    rows_by_source: dict[str, list[dict[str, object]]]
+    manifests: dict[str, DatasetManifest]
+
+
+@dataclass(frozen=True, slots=True)
+class Phase2BenchmarkTargets:
+    """Configuration for the dedicated Phase 2 realism benchmark."""
+
+    company_count: int = 3
+    per_company_targets: DatasetTargets = field(
+        default_factory=lambda: DatasetTargets(
+            account_count=len(ScenarioFamily),
+            email_count=24,
+            slack_count=24,
+            teams_count=24,
+            salesforce_count=24,
+            chunk_size=12,
+        )
+    )
+
+    def __post_init__(self) -> None:
+        if self.company_count < 3:
+            raise ValueError("company_count must be at least 3 for the Phase 2 benchmark")
+        if self.company_count > len(CompanyLanguageProfileType):
+            raise ValueError("company_count cannot exceed available company language profiles")
+        if self.per_company_targets.account_count < len(ScenarioFamily):
+            raise ValueError("per_company_targets.account_count must cover all scenario families")
+
+
+@dataclass(slots=True)
+class Phase2BenchmarkDataset:
+    """Dedicated multi-company Phase 2 benchmark dataset."""
+
+    enterprise: EnterpriseGraph
+    company_profiles: dict[str, CompanyLanguageProfileType]
+    rows_by_source: dict[str, list[dict[str, object]]]
+    manifests: dict[str, DatasetManifest]
+    benchmark_manifest: Phase2BenchmarkManifest
+    benchmark_manifest_path: Path
 
 
 @dataclass(slots=True)
@@ -253,6 +326,210 @@ class GenerationPipeline:
                 records_by_source["salesforce"],
             ),
             manifests=manifests,
+        )
+
+    def generate_multi_company_benchmark(
+        self,
+        *,
+        targets: MultiCompanyBenchmarkTargets,
+        destination_root: Path,
+        write_csv: bool = False,
+    ) -> MultiCompanyGeneratedDataset:
+        enterprises: list[EnterpriseGraph] = []
+        company_profiles: dict[str, CompanyLanguageProfileType] = {}
+        rows_by_source: dict[str, list[dict[str, object]]] = {
+            source_name: []
+            for source_name in SOURCE_NAMES
+        }
+
+        for company_index in range(targets.company_count):
+            company_context = self._benchmark_company_context(company_index=company_index)
+            company_pipeline = GenerationPipeline(
+                context=company_context,
+                builder=self.builder,
+            )
+            enterprise = company_pipeline.build_enterprise(
+                account_count=targets.per_company_targets.account_count,
+            )
+            bundles = company_pipeline.select_cross_system_bundles(
+                enterprise=enterprise,
+                targets=targets.per_company_targets,
+            )
+            company = enterprise.companies[0]
+            company_profiles[company.id] = company_context.language_profile.profile_type
+            enterprises.append(enterprise)
+
+            for source_name in SOURCE_NAMES:
+                source_rows = company_pipeline.build_source_records(
+                    source_name=source_name,
+                    enterprise=enterprise,
+                    targets=targets.per_company_targets,
+                    bundles=bundles,
+                )
+                rows_by_source[source_name].extend(
+                    self._scope_rows_to_company(
+                        company_id=company.id,
+                        profile_type=company_context.language_profile.profile_type,
+                        rows=source_rows,
+                    )
+                )
+
+        manifests: dict[str, DatasetManifest] = {
+            source_name: write_source_dataset(
+                rows=rows_by_source[source_name],
+                destination_root=destination_root,
+                source_name=source_name,
+                seed=self.context.seed,
+                config={
+                    "benchmark": "multi_company",
+                    "company_count": targets.company_count,
+                    "company_profiles": {
+                        company_id: profile.value
+                        for company_id, profile in sorted(company_profiles.items())
+                    },
+                },
+                chunk_size=targets.per_company_targets.chunk_size,
+                write_csv=write_csv,
+            )
+            for source_name in SOURCE_NAMES
+        }
+
+        return MultiCompanyGeneratedDataset(
+            enterprise=_merge_enterprises(enterprises),
+            company_profiles=company_profiles,
+            rows_by_source=rows_by_source,
+            manifests=manifests,
+        )
+
+    def generate_phase2_benchmark(
+        self,
+        *,
+        targets: Phase2BenchmarkTargets,
+        destination_root: Path,
+        write_csv: bool = False,
+    ) -> Phase2BenchmarkDataset:
+        enterprises: list[EnterpriseGraph] = []
+        company_profiles: dict[str, CompanyLanguageProfileType] = {}
+        rows_by_source: dict[str, list[dict[str, object]]] = {
+            source_name: []
+            for source_name in SOURCE_NAMES
+        }
+        scenario_families: set[str] = set()
+        account_behavior_profiles: set[str] = set()
+
+        for company_index in range(targets.company_count):
+            company_context = self._phase2_benchmark_company_context(
+                company_index=company_index
+            )
+            company_pipeline = GenerationPipeline(
+                context=company_context,
+                builder=self.builder,
+            )
+            enterprise = company_pipeline.build_enterprise(
+                account_count=targets.per_company_targets.account_count,
+            )
+            bundles = company_pipeline.select_cross_system_bundles(
+                enterprise=enterprise,
+                targets=targets.per_company_targets,
+            )
+            company = enterprise.companies[0]
+            company_profiles[company.id] = company_context.language_profile.profile_type
+            enterprises.append(enterprise)
+
+            scenarios = ScenarioEngine(context=company_context).build_for_enterprise(enterprise)
+            scenario_families.update(
+                (
+                    scenario.kind.value
+                    if isinstance(scenario.kind, ScenarioFamily)
+                    else str(scenario.kind)
+                )
+                for scenario in scenarios
+            )
+
+            behavior_resolver = AccountBehaviorResolver(
+                context=company_context,
+                enterprise=enterprise,
+            )
+            account_behavior_profiles.update(
+                behavior_resolver.profile_for_account(account.id).profile_type.value
+                for account in enterprise.customer_accounts
+            )
+
+            for source_name in SOURCE_NAMES:
+                source_rows = company_pipeline.build_source_records(
+                    source_name=source_name,
+                    enterprise=enterprise,
+                    targets=targets.per_company_targets,
+                    bundles=bundles,
+                )
+                rows_by_source[source_name].extend(
+                    self._scope_rows_to_company(
+                        company_id=company.id,
+                        profile_type=company_context.language_profile.profile_type,
+                        rows=source_rows,
+                    )
+                )
+
+        manifests: dict[str, DatasetManifest] = {
+            source_name: write_source_dataset(
+                rows=rows_by_source[source_name],
+                destination_root=destination_root,
+                source_name=source_name,
+                seed=self.context.seed,
+                config={
+                    "benchmark": "phase2",
+                    "company_count": targets.company_count,
+                    "company_profiles": {
+                        company_id: profile.value
+                        for company_id, profile in sorted(company_profiles.items())
+                    },
+                },
+                chunk_size=targets.per_company_targets.chunk_size,
+                write_csv=write_csv,
+            )
+            for source_name in SOURCE_NAMES
+        }
+
+        benchmark_manifest = Phase2BenchmarkManifest(
+            benchmark_name="phase2_realism",
+            seed=self.context.seed,
+            company_count=targets.company_count,
+            company_profiles={
+                company_id: profile.value
+                for company_id, profile in sorted(company_profiles.items())
+            },
+            scenario_families=tuple(sorted(scenario_families)),
+            account_behavior_profiles=tuple(sorted(account_behavior_profiles)),
+            source_row_counts={
+                source_name: len(rows)
+                for source_name, rows in rows_by_source.items()
+            },
+            hard_negative_row_count=sum(
+                _is_hard_negative_row(row)
+                for rows in rows_by_source.values()
+                for row in rows
+            ),
+            messy_row_count=sum(
+                _is_phase2_messy_row(row)
+                for rows in rows_by_source.values()
+                for row in rows
+            ),
+            event_attendance_row_count=sum(
+                row["primary_category"] == CommunicationCategory.EVENT_ATTENDANCE.value
+                for rows in rows_by_source.values()
+                for row in rows
+            ),
+        )
+        benchmark_manifest_path = destination_root / "phase2_benchmark_manifest.json"
+        benchmark_manifest.write_json(benchmark_manifest_path)
+
+        return Phase2BenchmarkDataset(
+            enterprise=_merge_enterprises(enterprises),
+            company_profiles=company_profiles,
+            rows_by_source=rows_by_source,
+            manifests=manifests,
+            benchmark_manifest=benchmark_manifest,
+            benchmark_manifest_path=benchmark_manifest_path,
         )
 
     def generate_dataset_streaming(
@@ -598,6 +875,58 @@ class GenerationPipeline:
             )
         return GeneratorContext(seed=seed, config=config)
 
+    def _benchmark_company_context(self, *, company_index: int) -> GeneratorContext:
+        profile_types = tuple(CompanyLanguageProfileType)
+        profile_offset = self.context.derive_seed(
+            "pipeline:multi-company-profile-offset"
+        ) % len(profile_types)
+        profile_type = profile_types[(profile_offset + company_index) % len(profile_types)]
+        return GeneratorContext(
+            seed=self.context.derive_seed(f"pipeline:multi-company:{company_index}"),
+            config=replace(
+                self.context.config,
+                company_language_profile=profile_type,
+            ),
+        )
+
+    def _phase2_benchmark_company_context(self, *, company_index: int) -> GeneratorContext:
+        profile_types = tuple(CompanyLanguageProfileType)
+        profile_offset = self.context.derive_seed(
+            "pipeline:phase2-benchmark-profile-offset"
+        ) % len(profile_types)
+        profile_type = profile_types[(profile_offset + company_index) % len(profile_types)]
+        return GeneratorContext(
+            seed=self.context.derive_seed(f"pipeline:phase2-benchmark:{company_index}"),
+            config=replace(
+                self.context.config,
+                company_language_profile=profile_type,
+                noise_ratio=min(self.context.noise_ratio, 0.7),
+                hard_negative_ratio=max(self.context.hard_negative_ratio, 0.35),
+                cross_system_ratio=1.0,
+                messiness_rate=max(self.context.messiness_rate, 0.2),
+            ),
+        )
+
+    @staticmethod
+    def _scope_rows_to_company(
+        *,
+        company_id: str,
+        profile_type: CompanyLanguageProfileType,
+        rows: Sequence[DatasetRecord],
+    ) -> list[dict[str, object]]:
+        profile = resolve_company_language_profile(
+            seed=0,
+            explicit_profile=profile_type,
+        )
+        return [
+            _company_scoped_row(
+                company_id=company_id,
+                profile=profile,
+                row=row.to_dataframe_row(),
+            )
+            for row in rows
+        ]
+
     def _account_linked_events(self, enterprise: EnterpriseGraph) -> list[Event]:
         return [event for event in enterprise.events if event.account_id is not None]
 
@@ -646,3 +975,116 @@ class GenerationPipeline:
         matching = [item for item in items if relation(item) == account_id]
         remaining = [item for item in items if relation(item) != account_id]
         return [*matching, *remaining]
+
+
+def _merge_enterprises(enterprises: Sequence[EnterpriseGraph]) -> EnterpriseGraph:
+    return EnterpriseGraph(
+        companies=[company for enterprise in enterprises for company in enterprise.companies],
+        departments=[
+            department
+            for enterprise in enterprises
+            for department in enterprise.departments
+        ],
+        employees=[employee for enterprise in enterprises for employee in enterprise.employees],
+        customer_accounts=[
+            account
+            for enterprise in enterprises
+            for account in enterprise.customer_accounts
+        ],
+        contacts=[contact for enterprise in enterprises for contact in enterprise.contacts],
+        opportunities=[
+            opportunity
+            for enterprise in enterprises
+            for opportunity in enterprise.opportunities
+        ],
+        events=[event for enterprise in enterprises for event in enterprise.events],
+        products=[product for enterprise in enterprises for product in enterprise.products],
+        ticket_issues=[
+            ticket
+            for enterprise in enterprises
+            for ticket in enterprise.ticket_issues
+        ],
+        campaigns=[
+            campaign
+            for enterprise in enterprises
+            for campaign in enterprise.campaigns
+        ],
+        message_envelopes=[
+            envelope
+            for enterprise in enterprises
+            for envelope in enterprise.message_envelopes
+        ],
+        crm_activities=[
+            activity
+            for enterprise in enterprises
+            for activity in enterprise.crm_activities
+        ],
+    )
+
+
+def _company_scoped_row(
+    *,
+    company_id: str,
+    profile: CompanyLanguageProfile,
+    row: dict[str, object],
+) -> dict[str, object]:
+    scoped_row = {
+        **row,
+        "company_id": company_id,
+    }
+    source_system = str(scoped_row["source_system"])
+
+    if source_system == "email":
+        scoped_row["subject"] = _ensure_marker(scoped_row.get("subject"), profile.email_marker)
+    elif source_system == "slack":
+        scoped_row["body"] = _ensure_marker(scoped_row.get("body"), profile.slack_marker)
+    elif source_system == "teams":
+        scoped_row["body"] = _ensure_marker(scoped_row.get("body"), profile.teams_marker)
+    elif source_system == "salesforce":
+        scoped_row["text_body"] = _ensure_marker(scoped_row.get("text_body"), profile.crm_marker)
+
+    return scoped_row
+
+
+def _ensure_marker(value: object, marker: str) -> str:
+    base_text = str(value) if isinstance(value, str) else ""
+    if marker.lower() in base_text.lower():
+        return base_text
+    if not base_text:
+        return marker
+    return f"{marker}: {base_text}"
+
+
+def _is_hard_negative_row(row: dict[str, object]) -> bool:
+    if row.get("is_relevant") is not False:
+        return False
+
+    provenance = row.get("provenance")
+    if not isinstance(provenance, dict):
+        return False
+
+    return str(provenance.get("strength")).lower() == "weak"
+
+
+def _is_phase2_messy_row(row: dict[str, object]) -> bool:
+    if str(row.get("source_system")) != "salesforce":
+        return False
+    if str(row.get("status") or "").lower() == "reopened":
+        return True
+
+    structured_fields = row.get("structured_fields")
+    if not isinstance(structured_fields, dict):
+        return False
+
+    return any(
+        key in structured_fields
+        for key in (
+            "missing_fields",
+            "late_entry_days",
+            "contradicts_record_id",
+            "stage_sync_delay_days",
+            "stale_owner_snapshot_days",
+            "attendance_reconciliation_pending",
+            "follow_up_capture_state",
+        )
+    )

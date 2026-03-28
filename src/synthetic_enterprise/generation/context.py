@@ -11,6 +11,10 @@ from synthetic_enterprise.generation.config import (
     DateRangeConfig,
     GeneratorConfig,
 )
+from synthetic_enterprise.generation.language_profiles import (
+    CompanyLanguageProfile,
+    resolve_company_language_profile,
+)
 from synthetic_enterprise.generation.rng import derive_seed
 
 
@@ -23,6 +27,7 @@ class GeneratorContext:
     locale: str = field(init=False)
     faker_seed: int = field(init=False)
     rng_seed: int = field(init=False)
+    language_profile: CompanyLanguageProfile = field(init=False)
     faker: Faker = field(init=False, repr=False)
     rng: random.Random = field(init=False, repr=False)
 
@@ -33,6 +38,10 @@ class GeneratorContext:
         self.locale = self.config.locale
         self.faker_seed = self.seed
         self.rng_seed = self.seed
+        self.language_profile = resolve_company_language_profile(
+            seed=self.seed,
+            explicit_profile=self.config.company_language_profile,
+        )
         self.faker = Faker(self.locale)
         self.faker.seed_instance(self.faker_seed)
         self.rng = random.Random(self.rng_seed)
@@ -64,6 +73,10 @@ class GeneratorContext:
     @property
     def verbosity_ratio(self) -> float:
         return self.config.verbosity_ratio
+
+    @property
+    def messiness_rate(self) -> float:
+        return self.config.messiness_rate
 
     def derive_seed(self, namespace: str) -> int:
         return derive_seed(self.seed, namespace)

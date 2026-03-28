@@ -32,6 +32,31 @@ class DatasetManifest:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class Phase2BenchmarkManifest:
+    """Describes a dedicated Phase 2 benchmark export."""
+
+    benchmark_name: str
+    seed: int
+    company_count: int
+    company_profiles: dict[str, str] = field(default_factory=dict)
+    scenario_families: tuple[str, ...] = field(default_factory=tuple)
+    account_behavior_profiles: tuple[str, ...] = field(default_factory=tuple)
+    source_row_counts: dict[str, int] = field(default_factory=dict)
+    hard_negative_row_count: int = 0
+    messy_row_count: int = 0
+    event_attendance_row_count: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def write_json(self, destination: Path) -> None:
+        destination.write_text(
+            json.dumps(_normalize_value(self.to_dict()), sort_keys=True, indent=2),
+            encoding="utf-8",
+        )
+
+
 def _normalize_value(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
